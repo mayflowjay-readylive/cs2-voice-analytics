@@ -1,0 +1,6 @@
+[build]
+builder = "NIXPACKS"
+buildCommand = "go mod tidy && go build -o out"
+
+[deploy]
+startCommand = "./out"
