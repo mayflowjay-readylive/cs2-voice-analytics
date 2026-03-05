@@ -75,9 +75,6 @@ def aai_submit(upload_url: str) -> str:
     payload = {
         "audio_url": upload_url,
         "language_code": "da",
-        "punctuate": True,
-        "format_text": True,
-        "disfluencies": False,
     }
     resp = requests.post(f"{AAI_BASE}/transcript", headers=AAI_HEADERS, json=payload)
     resp.raise_for_status()
@@ -179,18 +176,6 @@ def set_status(match_id: str, status: str, extra: dict = None):
     )
 
 
-def delete_audio_files(match_id: str, players: list[dict]):
-    """Delete audio files from R2 after transcription — retention policy."""
-    for player in players:
-        audio_key = player.get("audioKey", "")
-        if not audio_key:
-            continue
-        try:
-            s3.delete_object(Bucket=S3_BUCKET, Key=audio_key)
-            log.info(f"  🗑️  Deleted audio: {audio_key}")
-        except Exception as e:
-            log.warning(f"  Failed to delete {audio_key}: {e}")
-
 
 # ─── Main processing ──────────────────────────────────────────────────────────
 
@@ -203,6 +188,7 @@ def process_session(match_id: str):
     for player in meta["players"]:
         steam_id  = player["steamId"]
         audio_key = player["audioKey"]
+        transcribed_successfully = False
 
         try:
             log.info(f"  Downloading audio for {steam_id} ({audio_key})…")
@@ -212,6 +198,7 @@ def process_session(match_id: str):
 
             if len(audio_bytes) < 1024:
                 log.info(f"  Skipping {steam_id}: audio too short")
+                transcribed_successfully = True  # nothing to retry
                 continue
 
             log.info(f"  Uploading to AssemblyAI…")
@@ -226,9 +213,17 @@ def process_session(match_id: str):
             utterances = aai_to_utterances(steam_id, result)
             log.info(f"  → {len(utterances)} utterances for {steam_id}")
             all_utterances.extend(utterances)
+            transcribed_successfully = True
 
         except Exception as e:
             log.error(f"  Failed to transcribe {steam_id}: {e}")
+
+        if transcribed_successfully:
+            try:
+                s3.delete_object(Bucket=S3_BUCKET, Key=audio_key)
+                log.info(f"  🗑️  Deleted audio: {audio_key}")
+            except Exception as e:
+                log.warning(f"  Failed to delete {audio_key}: {e}")
 
     all_utterances.sort(key=lambda u: u.t_start)
 
@@ -247,9 +242,6 @@ def process_session(match_id: str):
         Body=json.dumps(transcript, indent=2),
         ContentType="application/json",
     )
-
-    # Delete audio files after successful transcription
-    delete_audio_files(match_id, meta["players"])
 
     set_status(match_id, "pending_alignment", {
         "transcriptKey": f"matches/{match_id}/transcript.json",
