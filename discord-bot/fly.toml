@@ -1,0 +1,15 @@
+app = "cs2-voice-bot"
+primary_region = "ams"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
