@@ -6,10 +6,7 @@ primary_region = "ams"
 [env]
   NODE_ENV = "production"
 
-[[services]]
-  protocol = "tcp"
+[http_service]
   internal_port = 3000
-
-  [[services.ports]]
-    port = 443
-    handlers = ["tls", "http"]
+  force_https = true
+  min_machines_running = 1
