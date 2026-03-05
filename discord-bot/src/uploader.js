@@ -1,5 +1,5 @@
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { createReadStream } from "fs";
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { createReadStream } = require("fs");
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "auto",
@@ -12,21 +12,9 @@ const s3 = new S3Client({
 
 const BUCKET = process.env.S3_BUCKET || "cs2-voice-analytics";
 
-/**
- * Uploads all audio files + session metadata to S3/R2.
- *
- * Audio is uploaded first, meta.json last — the transcription worker
- * polls for meta.json with status=pending_transcription, so writing it
- * last ensures audio is already in place when the worker picks it up.
- *
- * Structure:
- *   matches/{matchId}/audio_{steamId}.pcm
- *   matches/{matchId}/meta.json        ← written last
- */
-export async function uploadSession({ matchId, audioFiles, startedAt }) {
+async function uploadSession({ matchId, audioFiles, startedAt }) {
   const prefix = `matches/${matchId}`;
 
-  // 1. Upload audio files first
   const uploadPromises = audioFiles.map(({ steamId, filePath }) =>
     s3.send(
       new PutObjectCommand({
@@ -47,7 +35,6 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
 
   await Promise.all(uploadPromises);
 
-  // 2. Upload meta.json only after all audio is safely stored
   const meta = {
     matchId,
     startedAt,
@@ -72,3 +59,5 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
 
   return { prefix, playerCount: audioFiles.length };
 }
+
+module.exports = { uploadSession };
