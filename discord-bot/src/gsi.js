@@ -1,11 +1,11 @@
-const http = require("http");
-const {
+import http from "http";
+import {
   S3Client,
   GetObjectCommand,
   ListObjectsV2Command,
   CopyObjectCommand,
   DeleteObjectCommand,
-} = require("@aws-sdk/client-s3");
+} from "@aws-sdk/client-s3";
 
 const PORT = process.env.PORT || 3000;
 const PHASE_LIVE     = "live";
@@ -43,19 +43,13 @@ async function renameSession(oldMatchId, newMatchId) {
   if (keys.length === 0) throw new Error(`No objects found under ${oldPrefix}`);
   await Promise.all(keys.map(key => {
     const newKey = newPrefix + key.slice(oldPrefix.length);
-    return s3.send(new CopyObjectCommand({
-      Bucket: BUCKET,
-      CopySource: `${BUCKET}/${key}`,
-      Key: newKey,
-    }));
+    return s3.send(new CopyObjectCommand({ Bucket: BUCKET, CopySource: `${BUCKET}/${key}`, Key: newKey }));
   }));
-  await Promise.all(keys.map(key =>
-    s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))
-  ));
+  await Promise.all(keys.map(key => s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))));
   console.log(`✅ Renamed session ${oldMatchId} → ${newMatchId}`);
 }
 
-function startGsiServer({ onMatchStart, onMatchEnd }) {
+export function startGsiServer({ onMatchStart, onMatchEnd }) {
   const lastPhase = new Map();
 
   const server = http.createServer(async (req, res) => {
@@ -108,10 +102,8 @@ function startGsiServer({ onMatchStart, onMatchEnd }) {
           const prefixes = (listResp.CommonPrefixes || []).map(p => p.Prefix);
           const sessions = (await Promise.all(
             prefixes.map(async prefix => {
-              try {
-                const meta = await getR2Json(`${prefix}meta.json`);
-                return { matchId: meta.matchId, startedAt: meta.startedAt };
-              } catch { return null; }
+              try { const meta = await getR2Json(`${prefix}meta.json`); return { matchId: meta.matchId, startedAt: meta.startedAt }; }
+              catch { return null; }
             })
           )).filter(Boolean);
           const THREE_HOURS = 3 * 60 * 60 * 1000;
@@ -126,12 +118,7 @@ function startGsiServer({ onMatchStart, onMatchEnd }) {
           }
           await renameSession(closest.matchId, demoMatchId);
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            linked: true,
-            oldMatchId: closest.matchId,
-            newMatchId: demoMatchId,
-            timeDiffSeconds: Math.round(closest.diff / 1000),
-          }));
+          res.end(JSON.stringify({ linked: true, oldMatchId: closest.matchId, newMatchId: demoMatchId, timeDiffSeconds: Math.round(closest.diff / 1000) }));
         } catch (err) {
           console.error("[link] Error:", err);
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -179,11 +166,9 @@ function handleGsiEvent(state, lastPhase, onMatchStart, onMatchEnd) {
   console.log(`[GSI] steamId=${steamId} phase: ${prev ?? "unknown"} → ${mapPhase}`);
   if (mapPhase === PHASE_LIVE && prev !== PHASE_LIVE) {
     const startedAt = Date.now() - START_DELAY_MS;
-    console.log(`[GSI] 🟢 Match live — triggering auto-start (matchId=${matchId})`);
     setTimeout(() => { onMatchStart({ matchId, steamId, startedAt, source: "gsi" }); }, START_DELAY_MS);
   }
   if (mapPhase === PHASE_GAMEOVER && prev === PHASE_LIVE) {
-    console.log(`[GSI] 🔴 Match over — triggering auto-stop (matchId=${matchId})`);
     onMatchEnd({ matchId, steamId, source: "gsi" });
   }
 }
@@ -193,5 +178,3 @@ function generateMatchId(state) {
   const ts  = Math.floor(Date.now() / 1000);
   return `${map}-${ts}`;
 }
-
-module.exports = { startGsiServer };
