@@ -77,8 +77,6 @@ def aai_submit(upload_url: str) -> str:
         "language_code": "da",
         "punctuate": True,
         "format_text": True,
-        "word_boost": CS2_WORD_BOOST,
-        "boost_param": "high",
         "disfluencies": False,
     }
     resp = requests.post(f"{AAI_BASE}/transcript", headers=AAI_HEADERS, json=payload)
