@@ -28,9 +28,9 @@ log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-S3_BUCKET          = os.environ["S3_BUCKET"]
+S3_BUCKET          = os.environ.get("S3_BUCKET", "")
 S3_ENDPOINT        = os.environ.get("S3_ENDPOINT")
-ASSEMBLYAI_API_KEY = os.environ["ASSEMBLYAI_API_KEY"]
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
 POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 AAI_POLL_INTERVAL  = int(os.environ.get("AAI_POLL_INTERVAL_SECONDS", "5"))
 
