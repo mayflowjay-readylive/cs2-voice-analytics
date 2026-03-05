@@ -1,6 +1,5 @@
 import { EndBehaviorType } from "@discordjs/voice";
-import pkg from "@discordjs/opus";
-const { OpusEncoder } = pkg;
+import OpusScript from "opusscript";
 import { createWriteStream, mkdirSync } from "fs";
 import { join } from "path";
 import { Transform } from "stream";
@@ -52,7 +51,7 @@ export class SessionRecorder {
       end: { behavior: EndBehaviorType.Manual },
     });
 
-    const encoder = new OpusEncoder(SAMPLE_RATE, CHANNELS);
+    const encoder = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.AUDIO);
 
     // Decode Opus → raw PCM
     const decoder = new Transform({
