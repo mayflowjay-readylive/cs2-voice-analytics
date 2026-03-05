@@ -119,7 +119,7 @@ def aai_submit(upload_url: str) -> str:
     """Submit a transcription job and return the transcript ID."""
     payload = {
         "audio_url": upload_url,
-        "language_code": "en",
+        "language_code": "da",
         "punctuate": True,
         "format_text": True,
         "word_boost": CS2_WORD_BOOST,
