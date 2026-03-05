@@ -1,5 +1,7 @@
 // Alignment Service
 //
+// Polls S3 for sessions with status=pending_a// Alignment Service
+//
 // Polls S3 for sessions with status=pending_alignment.
 // Merges demo parser output (from your existing Go service) with
 // voice transcripts into a unified per-round timeline.
@@ -8,6 +10,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -228,6 +231,10 @@ func getJSON(ctx context.Context, client *s3.Client, bucket, key string, v any) 
 	}
 	defer out.Body.Close()
 	return json.NewDecoder(out.Body).Decode(v)
+}
+
+func bytesReader(data []byte) *bytes.Reader {
+	return bytes.NewReader(data)
 }
 
 func putJSON(ctx context.Context, client *s3.Client, bucket, key string, v any) error {
