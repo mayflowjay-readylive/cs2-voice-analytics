@@ -11,6 +11,8 @@ import os
 import json
 import time
 import logging
+import subprocess
+import tempfile
 from dataclasses import dataclass, asdict
 
 import boto3
@@ -61,10 +63,29 @@ class Utterance:
 
 # ─── AssemblyAI helpers ───────────────────────────────────────────────────────
 
+def ogg_to_wav(ogg_bytes: bytes) -> bytes:
+    """Convert OGG/Opus bytes to WAV using ffmpeg."""
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_in:
+        tmp_in.write(ogg_bytes)
+        tmp_in_path = tmp_in.name
+    tmp_out_path = tmp_in_path.replace(".ogg", ".wav")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out_path],
+            check=True, capture_output=True,
+        )
+        with open(tmp_out_path, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp_in_path)
+        if os.path.exists(tmp_out_path):
+            os.unlink(tmp_out_path)
+
+
 def aai_upload(audio_bytes: bytes) -> str:
     resp = requests.post(
         f"{AAI_BASE}/upload",
-        headers={"authorization": ASSEMBLYAI_API_KEY, "content-type": "audio/ogg"},
+        headers={"authorization": ASSEMBLYAI_API_KEY, "content-type": "audio/wav"},
         data=audio_bytes,
     )
     resp.raise_for_status()
@@ -205,7 +226,9 @@ def process_session(match_id: str):
                 continue
 
             log.info(f"  Uploading to AssemblyAI…")
-            upload_url = aai_upload(audio_bytes)
+            wav_bytes  = ogg_to_wav(audio_bytes)
+            log.info(f"  WAV size: {len(wav_bytes) / 1024:.1f} KB")
+            upload_url = aai_upload(wav_bytes)
 
             transcript_id = aai_submit(upload_url)
             log.info(f"  Submitted: transcript_id={transcript_id}")
