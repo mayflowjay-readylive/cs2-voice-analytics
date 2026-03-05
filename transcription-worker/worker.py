@@ -77,6 +77,8 @@ def aai_submit(upload_url: str) -> str:
         "language_code": "da",
     }
     resp = requests.post(f"{AAI_BASE}/transcript", headers=AAI_HEADERS, json=payload)
+    if not resp.ok:
+        log.error(f"  AssemblyAI submit error {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     return resp.json()["id"]
 
