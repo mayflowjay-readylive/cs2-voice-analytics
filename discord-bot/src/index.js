@@ -1,13 +1,21 @@
-require("dotenv").config();
-const Eris = require("eris");
-const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
-const { SessionRecorder } = require("./recorder.js");
-const { uploadSession } = require("./uploader.js");
-const { startGsiServer } = require("./gsi.js");
+import "dotenv/config";
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from "discord.js";
+import { joinVoiceChannel, VoiceConnectionStatus, entersState, getVoiceConnection } from "@discordjs/voice";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { SessionRecorder } from "./recorder.js";
+import { uploadSession } from "./uploader.js";
+import { startGsiServer } from "./gsi.js";
 
-const bot = new Eris(process.env.DISCORD_TOKEN, {
-  intents: ["guilds", "guildVoiceStates"],
-  restMode: true,
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+  ],
+});
+
+client.on("error", (err) => {
+  console.error("Discord client error:", err.message);
 });
 
 const activeSessions = new Map();
@@ -44,24 +52,20 @@ function saveLinks() {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function startRecording({ guildId, voiceChannel, matchId, playerMap, startedAt }) {
-  const connection = await bot.joinVoiceChannel(voiceChannel.id, {
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
     selfDeaf: false,
     selfMute: true,
   });
 
-  console.log(`🔌 Voice connection state: ${connection.ready ? "ready" : "connecting..."}`);
-
-  if (!connection.ready) {
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Voice connection timeout")), 30_000);
-      connection.once("ready", () => { clearTimeout(timeout); resolve(); });
-      connection.once("error", (err) => { clearTimeout(timeout); reject(err); });
-    }).catch((err) => {
-      console.warn(`⚠️ Voice connection did not reach ready state: ${err.message} — continuing anyway`);
-    });
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+    console.log(`✅ Voice connection ready`);
+  } catch {
+    console.warn("⚠️ Voice connection did not reach Ready state — continuing anyway");
   }
-
-  connection.receive("opus");
 
   const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap });
   recorder.start();
@@ -85,7 +89,10 @@ async function cancelRecording(guildId) {
   const session = activeSessions.get(guildId);
   if (!session) return null;
   const { recorder, matchId } = session;
-  try { recorder.connection.disconnect(); } catch {}
+  for (const [, { audioStream, decoder, writeStream }] of recorder.receivers) {
+    try { audioStream.unpipe(decoder); audioStream.destroy(); decoder.end(); writeStream.destroy(); } catch {}
+  }
+  try { recorder.connection.destroy(); } catch {}
   activeSessions.delete(guildId);
   console.log(`🗑️ Recording cancelled: match=${matchId}`);
   return { matchId };
@@ -94,9 +101,9 @@ async function cancelRecording(guildId) {
 function findVoiceChannelForSteam(steamId) {
   const discordId = steamToDiscord.get(steamId);
   if (!discordId) return null;
-  for (const guild of bot.guilds.values()) {
-    for (const channel of guild.channels.values()) {
-      if (channel.type === 2 && channel.voiceMembers?.has(discordId)) {
+  for (const guild of client.guilds.cache.values()) {
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.isVoiceBased?.() && channel.members.has(discordId)) {
         return { guild, channel };
       }
     }
@@ -108,16 +115,16 @@ function findVoiceChannelForSteam(steamId) {
 
 startGsiServer({
   onMatchStart: async ({ matchId, steamId, startedAt }) => {
-    if (!bot.ready) return;
+    if (!client.isReady()) return;
     const location = findVoiceChannelForSteam(steamId);
     if (!location) { console.log(`[GSI] ${steamId} not in any voice channel — skipping`); return; }
     const { guild, channel } = location;
     const guildId = guild.id;
     if (activeSessions.has(guildId)) { console.log(`[GSI] Already recording — ignoring`); return; }
     const playerMap = { _source: "gsi" };
-    for (const [did] of channel.voiceMembers) {
-      for (const [sid, d] of steamToDiscord) {
-        if (d === did) playerMap[did] = sid;
+    for (const [discordId] of channel.members) {
+      for (const [sid, did] of steamToDiscord) {
+        if (did === discordId) playerMap[discordId] = sid;
       }
     }
     try {
@@ -127,7 +134,7 @@ startGsiServer({
     }
   },
   onMatchEnd: async ({ matchId, steamId }) => {
-    if (!bot.ready) return;
+    if (!client.isReady()) return;
     const location = findVoiceChannelForSteam(steamId);
     if (!location) return;
     const guildId = location.guild.id;
@@ -138,38 +145,30 @@ startGsiServer({
 
 // ─── Slash commands ───────────────────────────────────────────────────────────
 
-bot.on("ready", async () => {
-  console.log(`✅ Logged in as ${bot.user.username}#${bot.user.discriminator}`);
+const commands = [
+  new SlashCommandBuilder()
+    .setName("match")
+    .setDescription("Control match recording")
+    .addSubcommand((sub) =>
+      sub.setName("start").setDescription("Start recording a match")
+        .addStringOption((opt) => opt.setName("matchid").setDescription("Optional custom ID").setRequired(false))
+        .addStringOption((opt) => opt.setName("playermap").setDescription("steamid:discordid pairs, comma separated").setRequired(false))
+    )
+    .addSubcommand((sub) => sub.setName("end").setDescription("Stop recording and upload"))
+    .addSubcommand((sub) => sub.setName("cancel").setDescription("Stop and discard recording"))
+    .addSubcommand((sub) => sub.setName("status").setDescription("Check recording status")),
+  new SlashCommandBuilder()
+    .setName("link")
+    .setDescription("Link your Discord account to your Steam ID")
+    .addStringOption((opt) => opt.setName("steamid").setDescription("Your 64-bit Steam ID").setRequired(true)),
+];
+
+client.once("ready", async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
   loadLinks();
-
-  const commands = [
-    {
-      name: "match",
-      description: "Control match recording",
-      options: [
-        {
-          type: 1, name: "start", description: "Start recording a match",
-          options: [
-            { type: 3, name: "matchid", description: "Optional custom ID", required: false },
-            { type: 3, name: "playermap", description: "steamid:discordid pairs, comma separated", required: false },
-          ],
-        },
-        { type: 1, name: "end", description: "Stop recording and upload" },
-        { type: 1, name: "cancel", description: "Stop and discard recording" },
-        { type: 1, name: "status", description: "Check recording status" },
-      ],
-    },
-    {
-      name: "link",
-      description: "Link your Discord account to your Steam ID",
-      options: [
-        { type: 3, name: "steamid", description: "Your 64-bit Steam ID", required: true },
-      ],
-    },
-  ];
-
+  const rest = new REST().setToken(process.env.DISCORD_TOKEN);
   try {
-    await bot.bulkEditCommands(commands);
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands.map((c) => c.toJSON()) });
     console.log("✅ Slash commands registered");
   } catch (err) {
     console.error("Failed to register commands:", err.message);
@@ -178,112 +177,92 @@ bot.on("ready", async () => {
 
 // ─── Interactions ─────────────────────────────────────────────────────────────
 
-bot.on("interactionCreate", async (interaction) => {
-  if (interaction.type !== 2) return;
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-  const age = Date.now() - interaction.createdAt;
-  if (age > 2500) {
-    console.warn(`⚠️ Dropping stale interaction (${age}ms)`);
-    return;
-  }
+  const age = Date.now() - interaction.createdTimestamp;
+  if (age > 2500) { console.warn(`⚠️ Dropping stale interaction (${age}ms)`); return; }
 
-  console.log(`Interaction received: /${interaction.data.name} (age: ${age}ms)`);
+  console.log(`Interaction received: /${interaction.commandName} (age: ${age}ms)`);
 
-  const commandName = interaction.data.name;
-  const sub = interaction.data.options?.[0]?.name;
-  const getOpt = (name) => interaction.data.options?.[0]?.options?.find(o => o.name === name)?.value
-    ?? interaction.data.options?.find(o => o.name === name)?.value;
-
+  const { commandName, options, guildId, member } = interaction;
+  const sub = commandName === "match" ? options.getSubcommand() : null;
   const ephemeral = commandName === "link" || sub === "cancel" || sub === "status";
 
   try {
-    await interaction.defer(ephemeral ? 64 : 0);
+    await interaction.deferReply({ flags: ephemeral ? 64 : 0 });
   } catch (err) {
     console.error(`Failed to defer interaction:`, err.message);
     return;
   }
 
-  const guildId = interaction.guildID;
-
   try {
     if (commandName === "link") {
-      const steamId = getOpt("steamid");
+      const steamId = options.getString("steamid");
       if (!/^7656119\d{10}$/.test(steamId)) {
-        return interaction.editOriginalMessage("❌ Invalid Steam ID format. Must be a 17-digit SteamID64.");
+        return interaction.editReply("❌ Invalid Steam ID format. Must be a 17-digit SteamID64.");
       }
-      steamToDiscord.set(steamId, interaction.member.id);
+      steamToDiscord.set(steamId, interaction.user.id);
       saveLinks();
-      console.log(`Link: Discord ${interaction.member.id} → Steam ${steamId}`);
-      return interaction.editOriginalMessage(`✅ Linked your Discord account to Steam ID \`${steamId}\`.`);
+      return interaction.editReply(`✅ Linked your Discord account to Steam ID \`${steamId}\`.`);
     }
 
     if (commandName === "match") {
       if (sub === "start") {
-        if (activeSessions.has(guildId)) {
-          return interaction.editOriginalMessage("⚠️ A recording is already active. Use `/match end` first.");
-        }
-        const member = interaction.member;
-        const guild = bot.guilds.get(guildId);
-        const voiceChannelId = guild?.members?.get(member.id)?.voiceState?.channelID;
-        if (!voiceChannelId) {
-          return interaction.editOriginalMessage("❌ You must be in a voice channel to start recording.");
-        }
-        const voiceChannel = guild.channels.get(voiceChannelId);
+        if (activeSessions.has(guildId)) return interaction.editReply("⚠️ Already recording. Use `/match end` first.");
+        const voiceChannel = member.voice?.channel;
+        if (!voiceChannel) return interaction.editReply("❌ You must be in a voice channel to start recording.");
 
-        const matchId = getOpt("matchid") || `manual-${Date.now()}`;
-        const playerMapRaw = getOpt("playermap") || "";
+        const matchId = options.getString("matchid") || `manual-${Date.now()}`;
+        const playerMapRaw = options.getString("playermap") || "";
         const playerMap = { _source: "manual" };
         for (const pair of playerMapRaw.split(",").filter(Boolean)) {
           const [sid, did] = pair.trim().split(":");
           if (sid && did) playerMap[did] = sid;
         }
-        for (const [did] of voiceChannel.voiceMembers) {
-          for (const [sid, d] of steamToDiscord) {
-            if (d === did && !playerMap[did]) playerMap[did] = sid;
+        for (const [discordId] of voiceChannel.members) {
+          for (const [sid, did] of steamToDiscord) {
+            if (did === discordId && !playerMap[discordId]) playerMap[discordId] = sid;
           }
         }
 
         await startRecording({ guildId, voiceChannel, matchId, playerMap });
-        return interaction.editOriginalMessage(
+        return interaction.editReply(
           `🎙️ Recording started for match \`${matchId}\`\n` +
-          `Channel: **${voiceChannel.name}** | Players: ${voiceChannel.voiceMembers.size}\n` +
+          `Channel: **${voiceChannel.name}** | Players: ${voiceChannel.members.size}\n` +
           `Use \`/match end\` when done.`
         );
       }
 
       else if (sub === "end") {
-        if (!activeSessions.has(guildId)) {
-          return interaction.editOriginalMessage("❌ No active recording in this server.");
-        }
+        if (!activeSessions.has(guildId)) return interaction.editReply("❌ No active recording.");
         const result = await stopRecording(guildId);
-        return interaction.editOriginalMessage(
+        return interaction.editReply(
           `✅ Session uploaded for match \`${result.matchId}\`\n` +
           `${result.audioFiles.length} player tracks uploaded. Transcription will begin shortly.`
         );
       }
 
       else if (sub === "cancel") {
-        if (!activeSessions.has(guildId)) {
-          return interaction.editOriginalMessage("❌ No active recording in this server.");
-        }
+        const orphan = getVoiceConnection(guildId);
+        if (orphan) { orphan.destroy(); activeSessions.delete(guildId); return interaction.editReply("🗑️ Bot disconnected."); }
+        if (!activeSessions.has(guildId)) return interaction.editReply("❌ No active recording.");
         await cancelRecording(guildId);
-        return interaction.editOriginalMessage("🗑️ Recording cancelled — nothing was saved.");
+        return interaction.editReply("🗑️ Recording cancelled — nothing was saved.");
       }
 
       else if (sub === "status") {
         const session = activeSessions.get(guildId);
-        if (!session) return interaction.editOriginalMessage("📭 No active recording.");
+        if (!session) return interaction.editReply("📭 No active recording.");
         const elapsed = Math.floor((Date.now() - session.startedAt) / 1000);
-        return interaction.editOriginalMessage(
-          `🎙️ Recording active for match \`${session.matchId}\`\nElapsed: **${Math.floor(elapsed/60)}m ${elapsed%60}s**`
-        );
+        return interaction.editReply(`🎙️ Recording active for match \`${session.matchId}\`\nElapsed: **${Math.floor(elapsed/60)}m ${elapsed%60}s**`);
       }
     }
   } catch (err) {
     console.error("Interaction error:", err.message);
-    try { await interaction.editOriginalMessage("❌ Something went wrong: " + err.message); } catch {}
+    try { await interaction.editReply("❌ Something went wrong: " + err.message); } catch {}
   }
 });
 
 loadLinks();
-bot.connect();
+client.login(process.env.DISCORD_TOKEN);
