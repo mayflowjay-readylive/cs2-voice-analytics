@@ -217,7 +217,7 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
     res.end();
   });
 
-  server.listen(PORT, () => {
+  server.listen(PORT, "0.0.0.0", () => {
     console.log(`✅ GSI + API server listening on port ${PORT}`);
   });
 
