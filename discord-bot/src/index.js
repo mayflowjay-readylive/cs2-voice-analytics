@@ -18,6 +18,15 @@ client.on("error", (err) => {
   console.error("Discord client error:", err.message);
 });
 
+client.ws.on('VOICE_SERVER_UPDATE', (data) => {
+  console.log('🔊 VOICE_SERVER_UPDATE received for guild:', data.guild_id, 'endpoint:', data.endpoint);
+});
+client.ws.on('VOICE_STATE_UPDATE', (data) => {
+  if (data.user_id === client.user?.id) {
+    console.log('🎤 VOICE_STATE_UPDATE (self) received for guild:', data.guild_id, 'channel:', data.channel_id);
+  }
+});
+
 const activeSessions = new Map();
 const steamToDiscord = new Map();
 
@@ -205,7 +214,6 @@ client.once("ready", async () => {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // Drop interactions that are already expired before we even try to respond
   const age = Date.now() - interaction.createdTimestamp;
   if (age > 2500) {
     console.warn(`⚠️ Dropping stale interaction (${age}ms old) — already expired`);
