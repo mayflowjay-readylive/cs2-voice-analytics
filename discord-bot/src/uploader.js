@@ -18,10 +18,10 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
   const uploadPromises = audioFiles.map(({ steamId, filePath }) =>
     s3.send(new PutObjectCommand({
       Bucket: BUCKET,
-      Key: `${prefix}/audio_${steamId}.pcm`,
+      Key: `${prefix}/audio_${steamId}.ogg`,
       Body: createReadStream(filePath),
-      ContentType: "audio/pcm",
-      Metadata: { matchId, steamId, sampleRate: "48000", channels: "2", bitDepth: "16" },
+      ContentType: "audio/ogg",
+      Metadata: { matchId, steamId, sampleRate: "48000", channels: "2", codec: "opus" },
     }))
   );
 
@@ -34,7 +34,7 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
     players: audioFiles.map(({ discordId, steamId }) => ({
       discordId,
       steamId,
-      audioKey: `${prefix}/audio_${steamId}.pcm`,
+      audioKey: `${prefix}/audio_${steamId}.ogg`,
     })),
     status: "pending_transcription",
     createdAt: new Date().toISOString(),
