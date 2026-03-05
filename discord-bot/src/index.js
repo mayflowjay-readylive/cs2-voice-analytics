@@ -67,6 +67,7 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     adapterCreator: voiceChannel.guild.voiceAdapterCreator,
     selfDeaf: false,
     selfMute: true,
+    debug: true,
   });
 
   try {
