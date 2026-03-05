@@ -1,5 +1,5 @@
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
-const { createReadStream } = require("fs");
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { createReadStream } from "fs";
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "auto",
@@ -12,25 +12,17 @@ const s3 = new S3Client({
 
 const BUCKET = process.env.S3_BUCKET || "cs2-voice-analytics";
 
-async function uploadSession({ matchId, audioFiles, startedAt }) {
+export async function uploadSession({ matchId, audioFiles, startedAt }) {
   const prefix = `matches/${matchId}`;
 
   const uploadPromises = audioFiles.map(({ steamId, filePath }) =>
-    s3.send(
-      new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: `${prefix}/audio_${steamId}.pcm`,
-        Body: createReadStream(filePath),
-        ContentType: "audio/pcm",
-        Metadata: {
-          matchId,
-          steamId,
-          sampleRate: "48000",
-          channels: "2",
-          bitDepth: "16",
-        },
-      })
-    )
+    s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: `${prefix}/audio_${steamId}.pcm`,
+      Body: createReadStream(filePath),
+      ContentType: "audio/pcm",
+      Metadata: { matchId, steamId, sampleRate: "48000", channels: "2", bitDepth: "16" },
+    }))
   );
 
   await Promise.all(uploadPromises);
@@ -48,16 +40,12 @@ async function uploadSession({ matchId, audioFiles, startedAt }) {
     createdAt: new Date().toISOString(),
   };
 
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: `${prefix}/meta.json`,
-      Body: JSON.stringify(meta, null, 2),
-      ContentType: "application/json",
-    })
-  );
+  await s3.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: `${prefix}/meta.json`,
+    Body: JSON.stringify(meta, null, 2),
+    ContentType: "application/json",
+  }));
 
   return { prefix, playerCount: audioFiles.length };
 }
-
-module.exports = { uploadSession };
