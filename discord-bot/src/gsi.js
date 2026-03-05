@@ -15,6 +15,7 @@ import {
  *   GET  /analysis/:matchId       — Final player scores and match summary
  *   GET  /rounds/:matchId         — Per-round communication breakdown
  *   GET  /health                  — Simple health check
+ *   POST /sessions/link           — Link voice session to demo match ID
  */
 
 const PORT = process.env.PORT || 3000;
@@ -43,14 +44,12 @@ async function getR2Json(key) {
   return JSON.parse(body);
 }
 
-// List all keys under a prefix
 async function listR2Keys(prefix) {
   const cmd = new ListObjectsV2Command({ Bucket: BUCKET, Prefix: prefix });
   const resp = await s3.send(cmd);
   return (resp.Contents || []).map(o => o.Key);
 }
 
-// Rename a match folder in R2 by copying all objects then deleting the originals
 async function renameSession(oldMatchId, newMatchId) {
   const oldPrefix = `matches/${oldMatchId}/`;
   const newPrefix = `matches/${newMatchId}/`;
@@ -58,7 +57,6 @@ async function renameSession(oldMatchId, newMatchId) {
 
   if (keys.length === 0) throw new Error(`No objects found under ${oldPrefix}`);
 
-  // Copy each object to the new prefix
   await Promise.all(keys.map(key => {
     const newKey = newPrefix + key.slice(oldPrefix.length);
     return s3.send(new CopyObjectCommand({
@@ -68,7 +66,6 @@ async function renameSession(oldMatchId, newMatchId) {
     }));
   }));
 
-  // Delete originals
   await Promise.all(keys.map(key =>
     s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))
   ));
@@ -127,9 +124,6 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
     }
 
     // ── POST /sessions/link ───────────────────────────────────────────────────
-    // Called by process-match after a successful demo parse.
-    // Finds the voice session closest to matchDate and renames it to demoMatchId.
-    // Body: { matchDate: "2026-03-05T12:08:35Z", demoMatchId: "uuid-or-sharecode" }
     if (req.method === "POST" && url.pathname === "/sessions/link") {
       let body = "";
       req.on("data", chunk => (body += chunk));
@@ -143,7 +137,6 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
 
           const targetTs = new Date(matchDate).getTime();
 
-          // List all match folders in R2
           const listCmd = new ListObjectsV2Command({
             Bucket: BUCKET,
             Prefix: "matches/",
@@ -152,7 +145,6 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
           const listResp = await s3.send(listCmd);
           const prefixes = (listResp.CommonPrefixes || []).map(p => p.Prefix);
 
-          // Load meta.json for each session and find the closest by startedAt
           const sessions = (await Promise.all(
             prefixes.map(async prefix => {
               try {
@@ -164,8 +156,6 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
             })
           )).filter(Boolean);
 
-          // Only consider sessions that haven't been linked yet (id doesn't look like a demo id)
-          // and find the one whose startedAt is closest to matchDate (within 3 hours)
           const THREE_HOURS = 3 * 60 * 60 * 1000;
           const closest = sessions
             .filter(s => s.matchId !== demoMatchId)
@@ -196,7 +186,7 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
       return;
     }
 
-
+    // ── POST /gsi ─────────────────────────────────────────────────────────────
     if (req.method === "POST" && url.pathname === "/gsi") {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
@@ -217,7 +207,8 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
     res.end();
   });
 
-  server.listen(PORT, "0.0.0.0", () => {
+  // Bind to :: (dual-stack IPv4+IPv6) so Fly's proxy can reach the app
+  server.listen(PORT, "::", () => {
     console.log(`✅ GSI + API server listening on port ${PORT}`);
   });
 
