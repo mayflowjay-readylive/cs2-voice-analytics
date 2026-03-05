@@ -21,23 +21,25 @@ export class SessionRecorder {
     this.connection = connection;
     this.voiceChannel = voiceChannel;
     this.playerMap = playerMap; // discordId → steamId
-
     this.tmpDir = join(os.tmpdir(), `cs2-match-${matchId}`);
     mkdirSync(this.tmpDir, { recursive: true });
-
     this.receivers = new Map(); // discordId → { filePath, writeStream, encoder }
     this.audioFiles = []; // { discordId, steamId, filePath }
   }
 
   start() {
     const receiver = this.connection.receiver;
+    console.log(`🎧 Receiver attached, waiting for speaking events...`);
+    console.log(`🔌 Connection state: ${this.connection.state.status}`);
 
     receiver.speaking.on("start", (userId) => {
+      console.log(`🗣️ Speaking start detected for ${userId}`);
       if (this.receivers.has(userId)) return; // already recording this user
       this._startUserRecording(userId, receiver);
     });
 
     receiver.speaking.on("end", (userId) => {
+      console.log(`🔇 Speaking end for ${userId}`);
       // We don't close on speaking end — user may speak again.
       // We close everything on session stop().
     });
@@ -66,21 +68,19 @@ export class SessionRecorder {
     });
 
     const writeStream = createWriteStream(filePath);
-
     audioStream.pipe(decoder).pipe(writeStream);
 
     this.receivers.set(userId, { filePath, audioStream, decoder, writeStream, steamId });
-
     console.log(`🎤 Started recording user ${userId} (steam: ${steamId}) → ${filePath}`);
   }
 
   async stop() {
+    console.log(`⏹️ Stopping recording, receivers: ${this.receivers.size}`);
     const closePromises = [];
 
     for (const [userId, { filePath, audioStream, decoder, writeStream, steamId }] of this.receivers) {
       closePromises.push(
         new Promise((resolve, reject) => {
-          // Timeout guard — if finish never fires (stream error), don't hang forever
           const timeout = setTimeout(() => {
             reject(new Error(`Timed out waiting for writeStream to finish for ${userId}`));
           }, 15_000);
@@ -97,8 +97,6 @@ export class SessionRecorder {
             reject(err);
           });
 
-          // Cleanly end the pipeline: unpipe source, then end decoder which
-          // flushes through to writeStream and triggers "finish".
           audioStream.unpipe(decoder);
           audioStream.destroy();
           decoder.end();
@@ -107,9 +105,7 @@ export class SessionRecorder {
     }
 
     await Promise.all(closePromises);
-
     this.connection.destroy();
-
     return this.audioFiles;
   }
 }
