@@ -205,6 +205,15 @@ client.once("ready", async () => {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
+  // Drop interactions that are already expired before we even try to respond
+  const age = Date.now() - interaction.createdTimestamp;
+  if (age > 2500) {
+    console.warn(`⚠️ Dropping stale interaction (${age}ms old) — already expired`);
+    return;
+  }
+
+  console.log(`Interaction received: /${interaction.commandName} (age: ${age}ms)`);
+
   const { commandName, options, guildId, member } = interaction;
 
   const sub = commandName === "match" ? options.getSubcommand() : null;
@@ -213,7 +222,7 @@ client.on("interactionCreate", async (interaction) => {
   try {
     await interaction.deferReply({ flags: ephemeral ? 64 : 0 });
   } catch (err) {
-    console.error("Failed to defer interaction:", err.message);
+    console.error(`Failed to defer interaction (age: ${Date.now() - interaction.createdTimestamp}ms):`, err.message);
     return;
   }
 
