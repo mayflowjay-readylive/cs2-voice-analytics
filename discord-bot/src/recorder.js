@@ -1,5 +1,6 @@
 import { EndBehaviorType } from "@discordjs/voice";
-import { OpusEncoder } from "@discordjs/opus";
+import pkg from "@discordjs/opus";
+const { OpusEncoder } = pkg;
 import { createWriteStream, mkdirSync } from "fs";
 import { join } from "path";
 import { Transform } from "stream";
