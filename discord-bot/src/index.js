@@ -31,13 +31,32 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     selfMute: true,
   });
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+  await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
 
   const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap });
   recorder.start();
 
   activeSessions.set(guildId, { recorder, matchId, startedAt: startedAt ?? Date.now() });
   console.log(`🎙️ Recording started: match=${matchId}, channel=${voiceChannel.name}, source=${playerMap._source ?? "manual"}`);
+}
+
+async function cancelRecording(guildId) {
+  const session = activeSessions.get(guildId);
+  if (!session) return null;
+
+  const { recorder, matchId } = session;
+  // Stop streams and destroy connection — but don't upload anything
+  for (const [, { audioStream, decoder, writeStream }] of recorder.receivers) {
+    audioStream.unpipe(decoder);
+    audioStream.destroy();
+    decoder.end();
+    writeStream.destroy();
+  }
+  recorder.connection.destroy();
+  activeSessions.delete(guildId);
+
+  console.log(`🗑️ Recording cancelled and discarded: match=${matchId}`);
+  return { matchId };
 }
 
 async function stopRecording(guildId) {
@@ -143,8 +162,8 @@ const commands = [
         .addStringOption((opt) =>
           opt
             .setName("matchid")
-            .setDescription("Your match share code or custom ID")
-            .setRequired(true)
+            .setDescription("Optional custom ID — leave blank to auto-generate")
+            .setRequired(false)
         )
         .addStringOption((opt) =>
           opt
@@ -159,6 +178,11 @@ const commands = [
       sub
         .setName("end")
         .setDescription("Stop recording and upload the session")
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("cancel")
+        .setDescription("Stop recording and discard — nothing gets uploaded or analysed")
     )
     .addSubcommand((sub) =>
       sub
@@ -228,7 +252,8 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "❌ You must be in a voice channel to start recording.", ephemeral: true });
       }
 
-      const matchId = options.getString("matchid");
+      const rawMatchId = options.getString("matchid");
+      const matchId = rawMatchId || `manual-${Date.now()}`;
       const playerMapRaw = options.getString("playermap") || "";
 
       // Parse optional steamid:discordid map, then merge with any /link mappings
@@ -277,6 +302,22 @@ client.on("interactionCreate", async (interaction) => {
         console.error("Failed to stop/upload:", err);
         await interaction.editReply("❌ Error during upload: " + err.message);
       }
+    }
+
+    // ── /match cancel ─────────────────────────────────────────────────────────
+    else if (sub === "cancel") {
+      // Even if there's no active session, try to disconnect any orphaned voice connection
+      const { getVoiceConnection } = await import("@discordjs/voice");
+      const orphan = getVoiceConnection(guildId);
+      if (orphan) {
+        orphan.destroy();
+        return interaction.reply({ content: `🗑️ Bot disconnected.`, ephemeral: true });
+      }
+      if (!activeSessions.has(guildId)) {
+        return interaction.reply({ content: "❌ No active recording in this server.", ephemeral: true });
+      }
+      await cancelRecording(guildId);
+      interaction.reply({ content: `🗑️ Recording cancelled — nothing was saved.`, ephemeral: true });
     }
 
     // ── /match status ─────────────────────────────────────────────────────────
