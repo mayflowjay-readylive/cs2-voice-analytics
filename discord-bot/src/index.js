@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from "discord.js";
 import { joinVoiceChannel, VoiceConnectionStatus, entersState, getVoiceConnection } from "@discordjs/voice";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { SessionRecorder } from "./recorder.js";
 import { uploadSession } from "./uploader.js";
 import { startGsiServer } from "./gsi.js";
@@ -19,6 +20,34 @@ client.on("error", (err) => {
 
 const activeSessions = new Map();
 const steamToDiscord = new Map();
+
+// ─── Persist Steam→Discord links across restarts ──────────────────────────────
+
+const LINKS_FILE = "/app/data/steam_links.json";
+
+function loadLinks() {
+  try {
+    if (existsSync(LINKS_FILE)) {
+      const data = JSON.parse(readFileSync(LINKS_FILE, "utf8"));
+      for (const [steamId, discordId] of Object.entries(data)) {
+        steamToDiscord.set(steamId, discordId);
+      }
+      console.log(`✅ Loaded ${steamToDiscord.size} Steam link(s)`);
+    }
+  } catch (err) {
+    console.warn("Could not load links file:", err.message);
+  }
+}
+
+function saveLinks() {
+  try {
+    const dir = "/app/data";
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(LINKS_FILE, JSON.stringify(Object.fromEntries(steamToDiscord), null, 2));
+  } catch (err) {
+    console.warn("Could not save links file:", err.message);
+  }
+}
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -159,6 +188,7 @@ const commands = [
 
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  loadLinks();
   const rest = new REST().setToken(process.env.DISCORD_TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), {
@@ -177,16 +207,14 @@ client.on("interactionCreate", async (interaction) => {
 
   const { commandName, options, guildId, member } = interaction;
 
-  // Determine if this reply should be ephemeral (only visible to user)
   const sub = commandName === "match" ? options.getSubcommand() : null;
   const ephemeral = commandName === "link" || sub === "cancel" || sub === "status";
 
-  // Defer immediately — Discord requires a response within 3 seconds
   try {
     await interaction.deferReply({ flags: ephemeral ? 64 : 0 });
   } catch (err) {
     console.error("Failed to defer interaction:", err.message);
-    return; // Interaction already expired, nothing we can do
+    return;
   }
 
   try {
@@ -197,6 +225,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❌ Invalid Steam ID format. Must be a 17-digit SteamID64.");
       }
       steamToDiscord.set(steamId, interaction.user.id);
+      saveLinks();
       console.log(`Link: Discord ${interaction.user.id} → Steam ${steamId}`);
       return interaction.editReply(
         `✅ Linked your Discord account to Steam ID \`${steamId}\`.\nGSI auto-recording will now work for your matches.`
@@ -285,4 +314,5 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+loadLinks();
 client.login(process.env.DISCORD_TOKEN);
