@@ -31,7 +31,12 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     selfMute: true,
   });
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  // Try to wait for Ready, but continue anyway if UDP times out on Railway
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  } catch {
+    console.warn("⚠️ Voice connection did not reach Ready state — continuing anyway (UDP may be limited)");
+  }
 
   const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap });
   recorder.start();
