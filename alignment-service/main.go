@@ -29,8 +29,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3presign "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/aws-sdk-go-v2/service/s3/presign"
 )
 
 // ─── Types: Demo parser output (matches your existing Go parser) ──────────────
@@ -260,11 +258,11 @@ func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string,
 // ─── Generate presigned URL for demo ─────────────────────────────────────────
 
 func presignDemoURL(ctx context.Context, client *s3.Client, bucket, key string) (string, error) {
-	presignClient := presign.NewPresignClient(client)
+	presignClient := s3.NewPresignClient(client)
 	req, err := presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-	}, func(o *presign.PresignOptions) {
+	}, func(o *s3.PresignOptions) {
 		o.Expires = 30 * time.Minute
 	})
 	if err != nil {
@@ -633,6 +631,3 @@ func main() {
 		time.Sleep(pollInterval)
 	}
 }
-
-// Suppress unused import warning for s3presign types
-var _ s3presign.ObjectCannedACL
