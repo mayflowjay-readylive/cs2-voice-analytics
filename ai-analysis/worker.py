@@ -12,7 +12,8 @@ import time
 import logging
 
 import boto3
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -20,10 +21,9 @@ log = logging.getLogger(__name__)
 S3_BUCKET     = os.environ["S3_BUCKET"]
 S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-model = genai.GenerativeModel(GEMINI_MODEL)
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 s3 = boto3.client(
     "s3",
@@ -37,7 +37,7 @@ s3 = boto3.client(
 # ─── Prompt builders ──────────────────────────────────────────────────────────
 
 def build_player_context(timeline: dict) -> dict:
-    """Build a steamId → nickname map for the prompt (we only have steamIds)."""
+    """Build a steamId → Player_N alias map from all events in the timeline."""
     steam_ids = set()
     for round_ in timeline.get("rounds", []):
         for ev in round_.get("events", []):
@@ -47,25 +47,31 @@ def build_player_context(timeline: dict) -> dict:
 
 
 def render_round_for_prompt(round_: dict, player_names: dict) -> str:
-    lines = [f"--- Round {round_['roundNum']} (T={round_['tStart']:.1f}s to {round_['tEnd']:.1f}s) ---"]
-    for ev in round_["events"]:
-        t = ev["t"]
+    round_num = round_.get("roundNum", "?")
+    win_reason = round_.get("winReason", "")
+    winner = round_.get("winner", "")
+
+    lines = [f"--- Round {round_num} (winner: team {winner}, reason: {win_reason}) ---"]
+
+    for ev in round_.get("events", []):
+        t = ev.get("t", 0)
         pid = player_names.get(ev.get("steamId", ""), ev.get("steamId", "?"))
-        kind = ev["type"]
+        kind = ev.get("type", "")
 
         if kind == "utterance":
-            lines.append(f"  [{t:5.1f}s] 🎙️ {pid}: \"{ev['text']}\"")
+            lines.append(f"  [{t:6.1f}s] 🎙️ {pid}: \"{ev.get('text', '')}\"")
         elif kind == "kill":
             victim = player_names.get(ev.get("victim", ""), ev.get("victim", "?"))
-            lines.append(f"  [{t:5.1f}s] 💀 {pid} killed {victim} ({ev.get('weapon','')})")
-        elif kind == "bomb_plant":
-            lines.append(f"  [{t:5.1f}s] 💣 {pid} planted on {ev.get('site','?')}")
-        elif kind == "bomb_defuse":
-            lines.append(f"  [{t:5.1f}s] 🔧 {pid} defused")
-        elif kind == "round_end":
-            lines.append(f"  [{t:5.1f}s] 🏁 Round ended — {ev.get('winner','')} won ({ev.get('reason','')})")
-        elif kind == "utility_thrown":
-            lines.append(f"  [{t:5.1f}s] 💨 {pid} threw {ev.get('weapon','utility')}")
+            hs = " (HS)" if ev.get("headshot") else ""
+            trade = " [TRADE]" if ev.get("tradeKill") else ""
+            first = " [FIRST KILL]" if ev.get("firstKill") else ""
+            lines.append(f"  [{t:6.1f}s] 💀 {pid} killed {victim} ({ev.get('weapon', '')}){hs}{trade}{first}")
+        elif kind == "planted":
+            lines.append(f"  [      ] 💣 {pid} planted on {ev.get('site', '?')}")
+        elif kind == "defused":
+            lines.append(f"  [      ] 🔧 {pid} defused on {ev.get('site', '?')}")
+        elif kind == "exploded":
+            lines.append(f"  [      ] 💥 Bomb exploded on {ev.get('site', '?')}")
 
     return "\n".join(lines)
 
@@ -73,6 +79,7 @@ def render_round_for_prompt(round_: dict, player_names: dict) -> str:
 ROUND_ANALYSIS_SYSTEM = """You are an expert CS2 analyst specializing in team communication analysis.
 You will receive a CS2 round timeline combining voice communications (🎙️) with in-game events.
 Players are identified by aliases like Player_1, Player_2, etc.
+Voice comms may be in Danish mixed with English CS2 terms — analyse based on meaning, not language.
 Analyze the communication quality and return ONLY valid JSON with no preamble or markdown.
 
 Your JSON must match this schema exactly:
@@ -81,7 +88,7 @@ Your JSON must match this schema exactly:
   "toxic_utterances": [{"player": "<Player_N>", "text": "...", "reason": "..."}],
   "miscommunications": [{"player": "<Player_N>", "said": "...", "but_did": "...", "context": "..."}],
   "motivating_moments": [{"player": "<Player_N>", "text": "..."}],
-  "info_quality_scores": {"<Player_N>": <0.0–10.0>, ...},
+  "info_quality_scores": {"<Player_N>": <0.0-10.0>},
   "summary": "<2-3 sentence round communication summary>"
 }
 
@@ -92,7 +99,7 @@ For info quality: rate how useful each player's callouts were (positions, counts
 """
 
 MATCH_SUMMARY_SYSTEM = """You are an expert CS2 communication analyst.
-Given per-round analysis data (using Player_N aliases) and a player alias→steamId map,
+Given per-round analysis data (using Player_N aliases) and a player alias->steamId map,
 produce a final match-level player assessment keyed by steamId.
 Return ONLY valid JSON with no preamble or markdown.
 
@@ -100,19 +107,19 @@ Schema:
 {
   "players": [
     {
-      "steam_id": "<actual steamId from the provided map>",
-      "comms_score": <0–100>,
-      "igl_likelihood": <0–100>,
-      "toxicity_score": <0–100>,
-      "motivation_score": <0–100>,
-      "info_density": <0–100>,
-      "callout_accuracy": <0–100>,
+      "steam_id": "<actual steamId>",
+      "comms_score": <0-100>,
+      "igl_likelihood": <0-100>,
+      "toxicity_score": <0-100>,
+      "motivation_score": <0-100>,
+      "info_density": <0-100>,
+      "callout_accuracy": <0-100>,
       "dominant_role": "<entry|support|lurk|igl|awper|unknown>",
       "notable_moments": ["..."],
       "improvement_tips": ["..."]
     }
   ],
-  "team_chemistry_score": <0–100>,
+  "team_chemistry_score": <0-100>,
   "communication_flow": "<description>",
   "key_miscommunications": [{"round": <n>, "steam_id": "...", "description": "..."}],
   "match_summary": "<3-5 sentence overall communication summary>"
@@ -122,11 +129,23 @@ Schema:
 
 # ─── Analysis pipeline ────────────────────────────────────────────────────────
 
-def analyse_round(round_: dict, player_names: dict) -> dict:
-    round_text = render_round_for_prompt(round_, player_names)
+def gemini_json(prompt: str) -> dict:
+    """Call Gemini and parse JSON response."""
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
+    )
+    text = response.text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
 
+
+def analyse_round(round_: dict, player_names: dict) -> dict:
     # Skip rounds with no voice comms
-    has_comms = any(ev["type"] == "utterance" for ev in round_.get("events", []))
+    has_comms = any(ev.get("type") == "utterance" for ev in round_.get("events", []))
     if not has_comms:
         return {
             "igl_candidate": None,
@@ -137,45 +156,23 @@ def analyse_round(round_: dict, player_names: dict) -> dict:
             "summary": "No voice communications this round.",
         }
 
+    round_text = render_round_for_prompt(round_, player_names)
     prompt = ROUND_ANALYSIS_SYSTEM + "\n\n" + round_text
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
-
-    text = response.text.strip()
-    text = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
+    return gemini_json(prompt)
 
 
-def aggregate_and_summarise(round_analyses: list[dict], timeline: dict, player_names: dict) -> dict:
-    """Send all round analyses to Gemini for final player scoring.
-    player_names is steamId → Player_N alias; we invert it for the prompt.
-    """
+def aggregate_and_summarise(round_analyses: list, timeline: dict, player_names: dict) -> dict:
     alias_to_steam = {alias: sid for sid, alias in player_names.items()}
-
     summary_input = {
         "match_id": timeline["matchId"],
+        "map": timeline.get("mapName", "unknown"),
+        "score": f"{timeline.get('team1Name','T1')} {timeline.get('scoreTeam1',0)} - {timeline.get('scoreTeam2',0)} {timeline.get('team2Name','T2')}",
         "round_count": len(round_analyses),
         "player_alias_map": alias_to_steam,
         "round_analyses": round_analyses,
     }
-
     prompt = MATCH_SUMMARY_SYSTEM + "\n\n" + json.dumps(summary_input, indent=2)
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
-
-    text = response.text.strip()
-    text = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
+    return gemini_json(prompt)
 
 
 def process_session(match_id: str):
@@ -189,17 +186,19 @@ def process_session(match_id: str):
     player_names = build_player_context(timeline)
     log.info(f"  Players: {player_names}")
 
+    rounds = timeline.get("rounds", [])
+    log.info(f"  Rounds: {len(rounds)}, map: {timeline.get('mapName', 'unknown')}")
+
     # Analyse each round
     round_analyses = []
-    for i, round_ in enumerate(timeline.get("rounds", [])):
-        log.info(f"  Analysing round {round_['roundNum']} ({i+1}/{len(timeline['rounds'])})…")
+    for i, round_ in enumerate(rounds):
+        log.info(f"  Analysing round {round_.get('roundNum')} ({i+1}/{len(rounds)})…")
         try:
             analysis = analyse_round(round_, player_names)
-            analysis["round_num"] = round_["roundNum"]
+            analysis["round_num"] = round_.get("roundNum")
             round_analyses.append(analysis)
         except Exception as e:
-            log.error(f"  Round {round_['roundNum']} analysis failed: {e}")
-
+            log.error(f"  Round {round_.get('roundNum')} analysis failed: {e}")
         time.sleep(0.5)  # Rate limit courtesy pause
 
     # Upload round analyses
@@ -209,6 +208,7 @@ def process_session(match_id: str):
         Body=json.dumps(round_analyses, indent=2),
         ContentType="application/json",
     )
+    log.info(f"  Uploaded round_analyses.json ({len(round_analyses)} rounds)")
 
     # Final match-level summary
     log.info("  Generating match-level player scores…")
@@ -223,7 +223,7 @@ def process_session(match_id: str):
         ContentType="application/json",
     )
 
-    # Update status → ready to surface in frontend
+    # Update status → complete
     obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{prefix}/meta.json")
     meta = json.loads(obj["Body"].read())
     meta["status"] = "complete"
@@ -255,15 +255,31 @@ def list_pending():
 
 
 def main():
-    log.info("🤖 AI analysis worker started")
+    log.info(f"🤖 AI analysis worker started (model: {GEMINI_MODEL})")
     while True:
         try:
             pending = list_pending()
+            if pending:
+                log.info(f"Found {len(pending)} pending session(s): {pending}")
             for match_id in pending:
                 try:
                     process_session(match_id)
                 except Exception as e:
                     log.error(f"Error analysing {match_id}: {e}")
+                    # Mark as error so it doesn't keep retrying
+                    try:
+                        obj = s3.get_object(Bucket=S3_BUCKET, Key=f"matches/{match_id}/meta.json")
+                        meta = json.loads(obj["Body"].read())
+                        meta["status"] = "error_analysis"
+                        meta["error"] = str(e)
+                        s3.put_object(
+                            Bucket=S3_BUCKET,
+                            Key=f"matches/{match_id}/meta.json",
+                            Body=json.dumps(meta, indent=2),
+                            ContentType="application/json",
+                        )
+                    except Exception:
+                        pass
         except Exception as e:
             log.error(f"Worker error: {e}")
         time.sleep(POLL_INTERVAL)
