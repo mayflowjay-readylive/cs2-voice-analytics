@@ -1,6 +1,5 @@
 [build]
-builder = "NIXPACKS"
-buildCommand = "go mod tidy && go build -o out"
+builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "./out"
+startCommand = "./alignment"
