@@ -18,7 +18,8 @@ from dataclasses import dataclass, asdict
 
 import boto3
 import opuslib
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -30,10 +31,8 @@ S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-model = genai.GenerativeModel(GEMINI_MODEL)
-
-s3 = boto3.client(
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")s3 = boto3.client(
     "s3",
     endpoint_url=S3_ENDPOINT,
     aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
@@ -124,20 +123,24 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
 
     try:
         log.info(f"  Uploading to Gemini Files API…")
-        audio_file = genai.upload_file(tmp.name, mime_type="audio/wav")
+        audio_file = client.files.upload(
+            file=tmp.name,
+            config=types.UploadFileConfig(mime_type="audio/wav"),
+        )
 
         # Wait for file to be processed
         while audio_file.state.name == "PROCESSING":
             time.sleep(1)
-            audio_file = genai.get_file(audio_file.name)
+            audio_file = client.files.get(name=audio_file.name)
 
         if audio_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {audio_file.state}")
 
         log.info(f"  Requesting transcription…")
-        response = model.generate_content(
-            [TRANSCRIPTION_PROMPT, audio_file],
-            generation_config=genai.GenerationConfig(
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[TRANSCRIPTION_PROMPT, audio_file],
+            config=types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
             ),
@@ -145,7 +148,7 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
 
         # Clean up uploaded file
         try:
-            genai.delete_file(audio_file.name)
+            client.files.delete(name=audio_file.name)
         except Exception:
             pass
 
