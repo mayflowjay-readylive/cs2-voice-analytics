@@ -5,7 +5,7 @@ import { EndBehaviorType } from "@discordjs/voice";
 
 // Saves raw Opus packets in a simple length-prefixed binary format:
 //   [4 bytes: packet length (uint32 LE)] [N bytes: opus packet]
-// The worker decodes this using pyogg + opuslib, then converts to WAV for AssemblyAI.
+// The worker decodes this using opuslib, then converts to WAV for transcription.
 
 export class SessionRecorder {
   constructor({ matchId, connection, voiceChannel, playerMap }) {
@@ -23,6 +23,18 @@ export class SessionRecorder {
     const receiver = this.connection.receiver;
     console.log(`🎧 Receiver attached, waiting for speaking events...`);
     console.log(`🔌 Connection state: ${this.connection.state.status}`);
+
+    // Suppress DAVE E2EE decryption errors during handshake —
+    // these fire when a user joins mid-session before DAVE negotiation completes.
+    // Without these handlers the error propagates and crashes the process.
+    this.connection.on("error", (err) => {
+      console.warn(`⚠️ Voice connection error (suppressed): ${err.message}`);
+    });
+    if (receiver.on) {
+      receiver.on("error", (err) => {
+        console.warn(`⚠️ Receiver error (suppressed): ${err.message}`);
+      });
+    }
 
     receiver.speaking.on("start", (userId) => {
       console.log(`🗣️ Speaking start detected for ${userId}`);
@@ -50,6 +62,10 @@ export class SessionRecorder {
       lenBuf.writeUInt32LE(packet.length, 0);
       writeStream.write(lenBuf);
       writeStream.write(packet);
+    });
+
+    audioStream.on("error", (err) => {
+      console.warn(`⚠️ Audio stream error for ${userId} (suppressed): ${err.message}`);
     });
 
     this.receivers.set(userId, { filePath, audioStream, writeStream, steamId });
