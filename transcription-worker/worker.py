@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 S3_BUCKET     = os.environ.get("S3_BUCKET", "")
 S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
