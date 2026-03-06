@@ -7,6 +7,8 @@ import { EndBehaviorType } from "@discordjs/voice";
 //   [4 bytes: packet length (uint32 LE)] [N bytes: opus packet]
 // The worker decodes this using opuslib, then converts to WAV for transcription.
 
+const DAVE_HANDSHAKE_DELAY_MS = 3000; // Wait for DAVE E2EE negotiation to complete
+
 export class SessionRecorder {
   constructor({ matchId, connection, voiceChannel, playerMap }) {
     this.matchId = matchId;
@@ -36,15 +38,23 @@ export class SessionRecorder {
       });
     }
 
-    receiver.speaking.on("start", (userId) => {
-      console.log(`🗣️ Speaking start detected for ${userId}`);
-      if (this.receivers.has(userId)) return;
-      this._startUserRecording(userId, receiver);
-    });
+    // Delay attaching speaking listeners until DAVE handshake is complete.
+    // This prevents dropped/errored packets from the first few seconds being
+    // recorded as garbage, and avoids crashes from unencrypted handshake packets.
+    console.log(`⏳ Waiting ${DAVE_HANDSHAKE_DELAY_MS}ms for DAVE handshake to complete…`);
+    setTimeout(() => {
+      console.log(`✅ DAVE delay complete — now listening for speech`);
 
-    receiver.speaking.on("end", (userId) => {
-      console.log(`🔇 Speaking end for ${userId}`);
-    });
+      receiver.speaking.on("start", (userId) => {
+        console.log(`🗣️ Speaking start detected for ${userId}`);
+        if (this.receivers.has(userId)) return;
+        this._startUserRecording(userId, receiver);
+      });
+
+      receiver.speaking.on("end", (userId) => {
+        console.log(`🔇 Speaking end for ${userId}`);
+      });
+    }, DAVE_HANDSHAKE_DELAY_MS);
   }
 
   _startUserRecording(userId, receiver) {
