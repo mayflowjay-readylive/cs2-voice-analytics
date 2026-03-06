@@ -98,25 +98,86 @@ def opus_to_wav(opus_bytes: bytes) -> bytes:
 
 # ─── Gemini transcription ─────────────────────────────────────────────────────
 
-TRANSCRIPTION_PROMPT = """This is a voice recording from a CS2 (Counter-Strike 2) match.
-The player is speaking Danish, often mixing in English CS2 terms and callouts
-(e.g. "B site", "AWP", "flash", "smoke", "banana", "catwalk", "CT", "T side").
+# All known CS2 callouts and terms — used in prompt and cleanup pass
+CS2_CALLOUTS = [
+    # Sites & areas
+    "A site", "B site", "mid", "CT", "T side", "CT spawn", "T spawn",
+    # General map areas
+    "catwalk", "banana", "connector", "jungle", "palace", "apartments",
+    "window", "pit", "arch", "library", "van", "truck", "heaven", "hell",
+    "long", "short", "ramp", "squeaky", "vent", "tunnels", "underpass",
+    "boost", "platform", "short corner", "long corner", "cat", "goose",
+    "closet", "quad", "dark", "coffin", "new box", "old box",
+    # Weapons
+    "AWP", "AK", "AK-47", "M4", "M4A1", "M4A4", "MP9", "MAC-10", "UMP",
+    "Deagle", "Desert Eagle", "P250", "Tec-9", "CZ", "FAMAS", "Galil",
+    "SG", "SG553", "AUG", "SCAR", "G3SG1", "SSG", "Scout",
+    # Utility
+    "Molotov", "flash", "flashbang", "smoke", "HE", "grenade", "decoy",
+    "incendiary", "pop flash", "one-way smoke",
+    # Actions & tactics
+    "defuse", "plant", "retake", "rotate", "rush", "eco", "force buy",
+    "full buy", "half buy", "save", "drop", "peek", "hold", "anchor",
+    "entry", "lurk", "IGL", "execute", "fake", "split", "stack",
+    "one-tap", "spray", "burst", "wallbang", "boost", "jump peek",
+    "shoulder peek", "wide peek", "jiggle peek",
+    # Callout phrases
+    "he's low", "I'm low", "need flash", "smoking", "flashing",
+    "going B", "going A", "pushing mid", "they're rushing",
+]
 
-Transcribe exactly what is said. Keep English CS2 terms as-is.
-Return ONLY a JSON array of utterances with this exact schema, no preamble:
+def build_transcription_prompt(map_name: str = None) -> str:
+    map_line = f"Map: {map_name}" if map_name else "Map: unknown (could be any CS2 map)"
+    callout_list = ", ".join(f'"{c}"' for c in CS2_CALLOUTS)
+    return f"""This is a voice recording from a CS2 (Counter-Strike 2) match.
+The player is speaking Danish, frequently mixing in English CS2 terms.
+
+{map_line}
+
+Common CS2 terms and callouts you may hear (keep these exactly as written):
+{callout_list}
+
+Instructions:
+- Transcribe exactly what is said in Danish
+- Keep all English CS2 terms, weapon names, and callouts exactly as listed above
+- If a word sounds like a CS2 term, use the correct spelling from the list
+- Preserve natural Danish grammar and sentence structure
+- Split into separate utterances at natural pauses (>1 second of silence)
+
+Return ONLY a JSON array with this exact schema, no preamble or markdown:
 [
-  {
+  {{
     "t_start": <seconds as float>,
     "t_end": <seconds as float>,
     "text": "<transcribed text>",
     "confidence": <0.0-1.0>
-  }
+  }}
 ]
 
 If there is silence or no speech, return an empty array: []
 """
 
-def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
+CLEANUP_PROMPT = """You are a CS2 communication transcript editor.
+The following transcript was auto-generated from a Danish CS2 voice recording.
+It may contain errors in CS2 callouts, weapon names, or tactical terms.
+
+Known correct CS2 terms (fix any misspellings or misheard versions):
+{callout_list}
+
+Rules:
+- Fix obvious CS2 term errors (e.g. "a dæbliup" → "AWP", "molly" → "Molotov")
+- Fix Danish words that were clearly misheard CS2 terms
+- Do NOT change correct Danish words or grammar
+- Do NOT add or remove content — only fix errors
+- Return the corrected utterances in the exact same JSON format as input
+
+Input transcript:
+{transcript_json}
+
+Return ONLY the corrected JSON array, no preamble or markdown."""
+
+
+def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None) -> list[Utterance]:
     """Upload WAV to Gemini Files API and transcribe."""
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.write(wav_bytes)
@@ -137,10 +198,11 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
         if audio_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {audio_file.state}")
 
-        log.info(f"  Requesting transcription…")
+        prompt = build_transcription_prompt(map_name)
+        log.info(f"  Requesting transcription (gemini-2.5-pro)…")
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[TRANSCRIPTION_PROMPT, audio_file],
+            model="gemini-2.5-pro",
+            contents=[prompt, audio_file],
             config=types.GenerateContentConfig(
                 temperature=0.0,
                 response_mime_type="application/json",
@@ -155,6 +217,10 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
 
         text = response.text.strip().replace("```json", "").replace("```", "").strip()
         raw_utterances = json.loads(text)
+        log.info(f"  Raw transcription: {len(raw_utterances)} utterances")
+
+        # Post-processing cleanup pass
+        raw_utterances = cleanup_transcript(raw_utterances)
 
         return [
             Utterance(
@@ -170,6 +236,35 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
 
     finally:
         os.unlink(tmp.name)
+
+
+def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
+    """Post-processing pass to fix CS2 term errors using Gemini."""
+    if not raw_utterances:
+        return raw_utterances
+
+    callout_list = ", ".join(f'"{c}"' for c in CS2_CALLOUTS)
+    prompt = CLEANUP_PROMPT.format(
+        callout_list=callout_list,
+        transcript_json=json.dumps(raw_utterances, ensure_ascii=False, indent=2),
+    )
+
+    log.info(f"  Running cleanup pass…")
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[prompt],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            response_mime_type="application/json",
+        ),
+    )
+
+    text = response.text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(text)
+    except Exception as e:
+        log.warning(f"  Cleanup pass failed to parse, using original: {e}")
+        return raw_utterances
 
 
 # ─── S3 helpers ───────────────────────────────────────────────────────────────
