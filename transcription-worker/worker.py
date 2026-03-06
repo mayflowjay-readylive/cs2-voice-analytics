@@ -1,9 +1,9 @@
 """
-Transcription Worker (AssemblyAI)
-==================================
+Transcription Worker (Gemini)
+==============================
 Polls S3 for sessions with status=pending_transcription.
-Uploads per-player OGG/Opus audio directly to AssemblyAI,
-polls until complete, writes timestamped transcripts back to S3,
+Decodes per-player Opus packets to WAV, uploads to Gemini Files API,
+transcribes in Danish, writes timestamped transcripts back to S3,
 then deletes audio files from R2 (retention policy).
 """
 
@@ -17,31 +17,21 @@ import tempfile
 from dataclasses import dataclass, asdict
 
 import boto3
-import requests
 import opuslib
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-S3_BUCKET          = os.environ.get("S3_BUCKET", "")
-S3_ENDPOINT        = os.environ.get("S3_ENDPOINT")
-ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
-POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-AAI_POLL_INTERVAL  = int(os.environ.get("AAI_POLL_INTERVAL_SECONDS", "5"))
+S3_BUCKET     = os.environ.get("S3_BUCKET", "")
+S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
+GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-AAI_BASE    = "https://api.assemblyai.com/v2"
-AAI_HEADERS = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
-
-CS2_WORD_BOOST = [
-    "B site", "A site", "catwalk", "mid", "long", "short", "banana",
-    "connector", "CT spawn", "T spawn", "jungle", "palace", "apartments",
-    "window", "boost", "one-tap", "AWP", "AK", "M4", "Molotov", "flash",
-    "smoke", "HE", "defuse", "plant", "eco", "force buy", "full buy",
-    "rush", "retake", "anchor", "entry", "lurk", "IGL", "rotate",
-    "Heaven", "Hell", "pit", "arch", "library", "van", "truck",
-]
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 s3 = boto3.client(
     "s3",
@@ -50,7 +40,6 @@ s3 = boto3.client(
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     region_name=os.environ.get("AWS_REGION", "auto"),
 )
-
 
 # ─── Data types ───────────────────────────────────────────────────────────────
 
@@ -63,10 +52,10 @@ class Utterance:
     confidence: float
 
 
-# ─── AssemblyAI helpers ───────────────────────────────────────────────────────
+# ─── Audio decoding ───────────────────────────────────────────────────────────
 
 def opus_to_wav(opus_bytes: bytes) -> bytes:
-    """Decode length-prefixed raw Opus packets to WAV (16kHz mono 16-bit)."""
+    """Decode length-prefixed raw Opus packets to WAV (48kHz stereo 16-bit)."""
     SAMPLE_RATE = 48000
     CHANNELS = 2
     FRAME_SIZE = 960  # 20ms at 48kHz
@@ -93,101 +82,90 @@ def opus_to_wav(opus_bytes: bytes) -> bytes:
 
     pcm_data = b"".join(pcm_chunks)
 
-    # Write WAV
-    buf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    buf.close()
-    with wave.open(buf.name, "wb") as wf:
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    with wave.open(tmp.name, "wb") as wf:
         wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(pcm_data)
 
-    with open(buf.name, "rb") as f:
+    with open(tmp.name, "rb") as f:
         wav_bytes = f.read()
-    os.unlink(buf.name)
+    os.unlink(tmp.name)
     return wav_bytes
 
 
-def aai_upload(audio_bytes: bytes) -> str:
-    resp = requests.post(
-        f"{AAI_BASE}/upload",
-        headers={"authorization": ASSEMBLYAI_API_KEY, "content-type": "audio/wav"},
-        data=audio_bytes,
-    )
-    resp.raise_for_status()
-    return resp.json()["upload_url"]
+# ─── Gemini transcription ─────────────────────────────────────────────────────
 
+TRANSCRIPTION_PROMPT = """This is a voice recording from a CS2 (Counter-Strike 2) match.
+The player is speaking Danish, often mixing in English CS2 terms and callouts
+(e.g. "B site", "AWP", "flash", "smoke", "banana", "catwalk", "CT", "T side").
 
-def aai_submit(upload_url: str) -> str:
-    payload = {
-        "audio_url": upload_url,
-        "language_code": "da",
-        "speech_models": ["universal-2"],
-    }
-    resp = requests.post(f"{AAI_BASE}/transcript", headers=AAI_HEADERS, json=payload)
-    if not resp.ok:
-        log.error(f"  AssemblyAI submit error {resp.status_code}: {resp.text}")
-    resp.raise_for_status()
-    return resp.json()["id"]
+Transcribe exactly what is said. Keep English CS2 terms as-is.
+Return ONLY a JSON array of utterances with this exact schema, no preamble:
+[
+  {
+    "t_start": <seconds as float>,
+    "t_end": <seconds as float>,
+    "text": "<transcribed text>",
+    "confidence": <0.0-1.0>
+  }
+]
 
+If there is silence or no speech, return an empty array: []
+"""
 
-def aai_poll(transcript_id: str, max_wait_seconds: int = 600) -> dict:
-    url = f"{AAI_BASE}/transcript/{transcript_id}"
-    waited = 0
-    while True:
-        resp = requests.get(url, headers=AAI_HEADERS)
-        resp.raise_for_status()
-        result = resp.json()
-        status = result["status"]
-        if status == "completed":
-            return result
-        elif status == "error":
-            raise RuntimeError(f"AssemblyAI error for {transcript_id}: {result.get('error')}")
-        elif waited >= max_wait_seconds:
-            raise TimeoutError(f"AssemblyAI job {transcript_id} timed out after {max_wait_seconds}s")
-        log.debug(f"    [{transcript_id}] status={status}, waiting…")
-        time.sleep(AAI_POLL_INTERVAL)
-        waited += AAI_POLL_INTERVAL
+def transcribe_with_gemini(wav_bytes: bytes, steam_id: str) -> list[Utterance]:
+    """Upload WAV to Gemini Files API and transcribe."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.write(wav_bytes)
+    tmp.close()
 
+    try:
+        log.info(f"  Uploading to Gemini Files API…")
+        audio_file = genai.upload_file(tmp.name, mime_type="audio/wav")
 
-def aai_to_utterances(steam_id: str, result: dict) -> list[Utterance]:
-    words = result.get("words", [])
-    if not words:
-        if result.get("text"):
-            return [Utterance(
+        # Wait for file to be processed
+        while audio_file.state.name == "PROCESSING":
+            time.sleep(1)
+            audio_file = genai.get_file(audio_file.name)
+
+        if audio_file.state.name == "FAILED":
+            raise RuntimeError(f"Gemini file processing failed: {audio_file.state}")
+
+        log.info(f"  Requesting transcription…")
+        response = model.generate_content(
+            [TRANSCRIPTION_PROMPT, audio_file],
+            generation_config=genai.GenerationConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+
+        # Clean up uploaded file
+        try:
+            genai.delete_file(audio_file.name)
+        except Exception:
+            pass
+
+        text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        raw_utterances = json.loads(text)
+
+        return [
+            Utterance(
                 steam_id=steam_id,
-                t_start=0.0,
-                t_end=result.get("audio_duration", 0.0),
-                text=result["text"],
-                confidence=result.get("confidence", 1.0),
-            )]
-        return []
+                t_start=u.get("t_start", 0.0),
+                t_end=u.get("t_end", 0.0),
+                text=u.get("text", ""),
+                confidence=u.get("confidence", 1.0),
+            )
+            for u in raw_utterances
+            if u.get("text", "").strip()
+        ]
 
-    utterances = []
-    SILENCE_THRESHOLD_MS = 800
-    current_words = [words[0]]
-    for word in words[1:]:
-        gap = word["start"] - current_words[-1]["end"]
-        if gap > SILENCE_THRESHOLD_MS:
-            utterances.append(_words_to_utterance(steam_id, current_words))
-            current_words = [word]
-        else:
-            current_words.append(word)
-    if current_words:
-        utterances.append(_words_to_utterance(steam_id, current_words))
-    return utterances
-
-
-def _words_to_utterance(steam_id: str, words: list[dict]) -> Utterance:
-    text = " ".join(w["text"] for w in words)
-    confidence = sum(w.get("confidence", 1.0) for w in words) / len(words)
-    return Utterance(
-        steam_id=steam_id,
-        t_start=words[0]["start"] / 1000.0,
-        t_end=words[-1]["end"] / 1000.0,
-        text=text,
-        confidence=round(confidence, 3),
-    )
+    finally:
+        os.unlink(tmp.name)
 
 
 # ─── S3 helpers ───────────────────────────────────────────────────────────────
@@ -226,7 +204,6 @@ def set_status(match_id: str, status: str, extra: dict = None):
     )
 
 
-
 # ─── Main processing ──────────────────────────────────────────────────────────
 
 def process_session(match_id: str):
@@ -248,25 +225,18 @@ def process_session(match_id: str):
 
             if len(audio_bytes) < 1024:
                 log.info(f"  Skipping {steam_id}: audio too short")
-                transcribed_successfully = True  # nothing to retry
+                transcribed_successfully = True
                 continue
 
             log.info(f"  Decoding Opus packets to WAV…")
-            wav_bytes  = opus_to_wav(audio_bytes)
+            wav_bytes = opus_to_wav(audio_bytes)
             if not wav_bytes:
                 log.info(f"  Skipping {steam_id}: no decodable audio")
                 transcribed_successfully = True
                 continue
             log.info(f"  WAV size: {len(wav_bytes) / 1024:.1f} KB")
-            upload_url = aai_upload(wav_bytes)
 
-            transcript_id = aai_submit(upload_url)
-            log.info(f"  Submitted: transcript_id={transcript_id}")
-
-            result = aai_poll(transcript_id)
-            log.info(f"  Completed: {len(result.get('words', []))} words")
-
-            utterances = aai_to_utterances(steam_id, result)
+            utterances = transcribe_with_gemini(wav_bytes, steam_id)
             log.info(f"  → {len(utterances)} utterances for {steam_id}")
             all_utterances.extend(utterances)
             transcribed_successfully = True
@@ -289,7 +259,7 @@ def process_session(match_id: str):
         "utterances":       [asdict(u) for u in all_utterances],
         "playerCount":      len(meta["players"]),
         "totalUtterances":  len(all_utterances),
-        "provider":         "assemblyai",
+        "provider":         "gemini",
     }
 
     s3.put_object(
@@ -308,7 +278,7 @@ def process_session(match_id: str):
 
 
 def main():
-    log.info("🎙️ Transcription worker started (AssemblyAI)")
+    log.info("🎙️ Transcription worker started (Gemini)")
     while True:
         try:
             pending = list_pending_sessions()
@@ -327,7 +297,6 @@ def main():
                 log.debug("No pending sessions, sleeping…")
         except Exception as e:
             log.error(f"Worker loop error: {e}")
-
         time.sleep(POLL_INTERVAL)
 
 
