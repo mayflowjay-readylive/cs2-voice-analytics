@@ -18,9 +18,9 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
   const uploadPromises = audioFiles.map(({ steamId, filePath }) =>
     s3.send(new PutObjectCommand({
       Bucket: BUCKET,
-      Key: `${prefix}/audio_${steamId}.ogg`,
+      Key: `${prefix}/audio_${steamId}.opus`,
       Body: createReadStream(filePath),
-      ContentType: "audio/ogg",
+      ContentType: "audio/opus",
       Metadata: { matchId, steamId, sampleRate: "48000", channels: "2", codec: "opus" },
     }))
   );
@@ -34,7 +34,7 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
     players: audioFiles.map(({ discordId, steamId }) => ({
       discordId,
       steamId,
-      audioKey: `${prefix}/audio_${steamId}.ogg`,
+      audioKey: `${prefix}/audio_${steamId}.opus`,
     })),
     status: "pending_transcription",
     createdAt: new Date().toISOString(),
