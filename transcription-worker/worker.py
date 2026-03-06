@@ -70,10 +70,13 @@ def ogg_to_wav(ogg_bytes: bytes) -> bytes:
         tmp_in_path = tmp_in.name
     tmp_out_path = tmp_in_path.replace(".ogg", ".wav")
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["ffmpeg", "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out_path],
-            check=True, capture_output=True,
+            capture_output=True,
         )
+        if result.returncode != 0:
+            log.error(f"  ffmpeg stderr: {result.stderr.decode()}")
+            result.check_returncode()
         with open(tmp_out_path, "rb") as f:
             return f.read()
     finally:
