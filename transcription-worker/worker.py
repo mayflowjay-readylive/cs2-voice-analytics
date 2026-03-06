@@ -32,7 +32,8 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")s3 = boto3.client(
+
+s3 = boto3.client(
     "s3",
     endpoint_url=S3_ENDPOINT,
     aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
