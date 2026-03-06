@@ -227,9 +227,12 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         await startRecording({ guildId, voiceChannel, matchId, playerMap });
+
+        // Subtract 1 to exclude the bot itself from the player count
+        const humanPlayerCount = voiceChannel.members.size - 1;
         return interaction.editReply(
           `🎙️ Recording started for match \`${matchId}\`\n` +
-          `Channel: **${voiceChannel.name}** | Players: ${voiceChannel.members.size}\n` +
+          `Channel: **${voiceChannel.name}** | Players: ${humanPlayerCount}\n` +
           `Use \`/match end\` when done.`
         );
       }
