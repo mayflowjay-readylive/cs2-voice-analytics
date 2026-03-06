@@ -11,12 +11,14 @@ import os
 import json
 import time
 import logging
-import subprocess
+import struct
+import wave
 import tempfile
 from dataclasses import dataclass, asdict
 
 import boto3
 import requests
+import opuslib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -63,26 +65,47 @@ class Utterance:
 
 # ─── AssemblyAI helpers ───────────────────────────────────────────────────────
 
-def ogg_to_wav(ogg_bytes: bytes) -> bytes:
-    """Convert OGG/Opus bytes to WAV using ffmpeg."""
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_in:
-        tmp_in.write(ogg_bytes)
-        tmp_in_path = tmp_in.name
-    tmp_out_path = tmp_in_path.replace(".ogg", ".wav")
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out_path],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            log.error(f"  ffmpeg stderr: {result.stderr.decode()}")
-            result.check_returncode()
-        with open(tmp_out_path, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(tmp_in_path)
-        if os.path.exists(tmp_out_path):
-            os.unlink(tmp_out_path)
+def opus_to_wav(opus_bytes: bytes) -> bytes:
+    """Decode length-prefixed raw Opus packets to WAV (16kHz mono 16-bit)."""
+    SAMPLE_RATE = 48000
+    CHANNELS = 2
+    FRAME_SIZE = 960  # 20ms at 48kHz
+
+    decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+    pcm_chunks = []
+
+    offset = 0
+    while offset + 4 <= len(opus_bytes):
+        pkt_len = struct.unpack_from("<I", opus_bytes, offset)[0]
+        offset += 4
+        if offset + pkt_len > len(opus_bytes):
+            break
+        packet = opus_bytes[offset:offset + pkt_len]
+        offset += pkt_len
+        try:
+            pcm = decoder.decode(bytes(packet), FRAME_SIZE)
+            pcm_chunks.append(pcm)
+        except Exception:
+            pass
+
+    if not pcm_chunks:
+        return b""
+
+    pcm_data = b"".join(pcm_chunks)
+
+    # Write WAV
+    buf = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    buf.close()
+    with wave.open(buf.name, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_data)
+
+    with open(buf.name, "rb") as f:
+        wav_bytes = f.read()
+    os.unlink(buf.name)
+    return wav_bytes
 
 
 def aai_upload(audio_bytes: bytes) -> str:
@@ -228,8 +251,12 @@ def process_session(match_id: str):
                 transcribed_successfully = True  # nothing to retry
                 continue
 
-            log.info(f"  Uploading to AssemblyAI…")
-            wav_bytes  = ogg_to_wav(audio_bytes)
+            log.info(f"  Decoding Opus packets to WAV…")
+            wav_bytes  = opus_to_wav(audio_bytes)
+            if not wav_bytes:
+                log.info(f"  Skipping {steam_id}: no decodable audio")
+                transcribed_successfully = True
+                continue
             log.info(f"  WAV size: {len(wav_bytes) / 1024:.1f} KB")
             upload_url = aai_upload(wav_bytes)
 
