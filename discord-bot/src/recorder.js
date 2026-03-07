@@ -47,8 +47,26 @@ export class SessionRecorder {
 
       receiver.speaking.on("start", (userId) => {
         console.log(`🗣️ Speaking start detected for ${userId}`);
-        if (this.receivers.has(userId)) return;
-        this._startUserRecording(userId, receiver);
+
+        // Check if we already have a receiver for this user
+        if (this.receivers.has(userId)) {
+          const existing = this.receivers.get(userId);
+          if (!existing.audioStream.destroyed) {
+            // Stream still active — normal speech resume after a pause, skip
+            return;
+          }
+          // Stream is dead — user disconnected and reconnected mid-match.
+          // Clean up the old write stream and re-subscribe, appending to the same file.
+          console.log(`🔄 ${userId} reconnected — re-subscribing (appending to existing file)`);
+          try { existing.writeStream.end(); } catch {}
+          const existingFilePath = existing.filePath;
+          const existingSteamId = existing.steamId;
+          this.receivers.delete(userId);
+          this._startUserRecording(userId, receiver, existingFilePath, existingSteamId);
+          return;
+        }
+
+        this._startUserRecording(userId, receiver, null, null);
       });
 
       receiver.speaking.on("end", (userId) => {
@@ -57,15 +75,17 @@ export class SessionRecorder {
     }, DAVE_HANDSHAKE_DELAY_MS);
   }
 
-  _startUserRecording(userId, receiver) {
-    const steamId = this.playerMap[userId] || `discord_${userId}`;
-    const filePath = join(this.tmpDir, `audio_${steamId}.opus`);
+  _startUserRecording(userId, receiver, existingFilePath, existingSteamId) {
+    const steamId = existingSteamId || this.playerMap[userId] || `discord_${userId}`;
+    const filePath = existingFilePath || join(this.tmpDir, `audio_${steamId}.opus`);
+    const isReconnect = !!existingFilePath;
 
     const audioStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
     });
 
-    const writeStream = createWriteStream(filePath);
+    // Append mode if reconnecting, write mode if first time
+    const writeStream = createWriteStream(filePath, { flags: isReconnect ? "a" : "w" });
 
     audioStream.on("data", (packet) => {
       const lenBuf = Buffer.alloc(4);
@@ -79,7 +99,8 @@ export class SessionRecorder {
     });
 
     this.receivers.set(userId, { filePath, audioStream, writeStream, steamId });
-    console.log(`🎤 Started recording user ${userId} (steam: ${steamId}) → ${filePath}`);
+    const mode = isReconnect ? "RECONNECT/append" : "new";
+    console.log(`🎤 Started recording user ${userId} (steam: ${steamId}, mode: ${mode}) → ${filePath}`);
   }
 
   async stop() {
