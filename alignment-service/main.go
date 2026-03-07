@@ -31,6 +31,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+const (
+	staleThreshold = 15 * time.Minute
+	maxRetries     = 3
+)
+
 // ─── Types: Demo parser output (matches your existing Go parser) ──────────────
 
 type KillEvent struct {
@@ -196,6 +201,91 @@ func putJSON(ctx context.Context, client *s3.Client, bucket, key string, v any) 
 	return err
 }
 
+// ─── Status helpers ───────────────────────────────────────────────────────────
+
+func setStatus(ctx context.Context, client *s3.Client, bucket, matchID, status string, extra map[string]interface{}) error {
+	prefix := "matches/" + matchID
+	var rawMeta map[string]interface{}
+	if err := getJSON(ctx, client, bucket, prefix+"/meta.json", &rawMeta); err != nil {
+		return err
+	}
+	rawMeta["status"] = status
+	rawMeta["statusUpdatedAt"] = time.Now().UTC().Format(time.RFC3339)
+	for k, v := range extra {
+		rawMeta[k] = v
+	}
+	return putJSON(ctx, client, bucket, prefix+"/meta.json", rawMeta)
+}
+
+// ─── Stuck session recovery ──────────────────────────────────────────────────
+
+func checkStaleSessions(ctx context.Context, client *s3.Client, bucket string) {
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(bucket),
+		Prefix:    aws.String("matches/"),
+		Delimiter: aws.String("/"),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			log.Printf("Stale check list error: %v", err)
+			return
+		}
+		for _, cp := range page.CommonPrefixes {
+			matchID := (*cp.Prefix)[len("matches/") : len(*cp.Prefix)-1]
+			var rawMeta map[string]interface{}
+			if err := getJSON(ctx, client, bucket, "matches/"+matchID+"/meta.json", &rawMeta); err != nil {
+				continue
+			}
+			status, _ := rawMeta["status"].(string)
+			if status != "aligning" {
+				continue
+			}
+
+			// Check staleness
+			var updatedAt time.Time
+			if ts, ok := rawMeta["statusUpdatedAt"].(string); ok && ts != "" {
+				if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+					updatedAt = parsed
+				}
+			}
+			if updatedAt.IsZero() {
+				// Fallback: use S3 object LastModified
+				head, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+					Bucket: aws.String(bucket),
+					Key:    aws.String("matches/" + matchID + "/meta.json"),
+				})
+				if err != nil {
+					continue
+				}
+				updatedAt = *head.LastModified
+			}
+
+			age := time.Since(updatedAt)
+			if age < staleThreshold {
+				continue
+			}
+
+			retryCount := 0
+			if rc, ok := rawMeta["retryCount"].(float64); ok {
+				retryCount = int(rc)
+			}
+
+			if retryCount >= maxRetries {
+				log.Printf("⛔ Session %s stuck in 'aligning' after %d retries — marking as error", matchID, maxRetries)
+				setStatus(ctx, client, bucket, matchID, "error_alignment", map[string]interface{}{
+					"error": fmt.Sprintf("Stuck in aligning after %d retries", maxRetries),
+				})
+			} else {
+				log.Printf("🔄 Session %s stuck in 'aligning' for %s — resetting (retry %d/%d)", matchID, age.Round(time.Second), retryCount+1, maxRetries)
+				setStatus(ctx, client, bucket, matchID, "pending_alignment", map[string]interface{}{
+					"retryCount": retryCount + 1,
+				})
+			}
+		}
+	}
+}
+
 // ─── Find matching demo in oldboyz-demo-bucket ────────────────────────────────
 
 // Demo files are named: demo_{timestampMs}_{random}.dem
@@ -219,7 +309,7 @@ func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string,
 	}
 
 	if len(allKeys) == 0 {
-		return "", fmt.Errorf("no demo files found in %s", demoBucket)
+		return "", fmt.Errorf("⚠️ NO DEMO FILES FOUND — demo bucket '%s' is empty. Make sure demos are being uploaded", demoBucket)
 	}
 
 	bestKey := ""
@@ -248,10 +338,27 @@ func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string,
 	}
 
 	if bestKey == "" {
+		// Build a helpful error message showing what demos ARE available
+		log.Printf("════════════════════════════════════════════════════════════")
+		log.Printf("⚠️  NO MATCHING DEMO FOUND")
+		log.Printf("   Recording started at: %d (%s)", recordingStartMs, time.UnixMilli(recordingStartMs).UTC().Format(time.RFC3339))
+		log.Printf("   Search window: ±30 minutes")
+		log.Printf("   Demos in bucket (%d total):", len(allKeys))
+		for _, key := range allKeys {
+			base := strings.TrimSuffix(key, ".dem")
+			parts := strings.Split(base, "_")
+			if len(parts) >= 2 {
+				if ts, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+					delta := (ts - recordingStartMs) / 1000
+					log.Printf("     %s → %s (delta: %ds)", key, time.UnixMilli(ts).UTC().Format(time.RFC3339), delta)
+				}
+			}
+		}
+		log.Printf("════════════════════════════════════════════════════════════")
 		return "", fmt.Errorf("no demo found within 30 minutes of recording start (recordingStartMs=%d)", recordingStartMs)
 	}
 
-	log.Printf("  Matched demo: %s (delta: %dms)", bestKey, bestDelta)
+	log.Printf("  ✅ Matched demo: %s (delta: %dms / %.1fs)", bestKey, bestDelta, float64(bestDelta)/1000.0)
 	return bestKey, nil
 }
 
@@ -286,8 +393,8 @@ func callDemoParser(parserURL, demoURL string) (*ParseResult, error) {
 		req.Header.Set("X-Parse-Secret", secret)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Do(req)
+	httpClient := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("parser request failed: %w", err)
 	}
@@ -307,9 +414,6 @@ func callDemoParser(parserURL, demoURL string) (*ParseResult, error) {
 
 // ─── Alignment logic ──────────────────────────────────────────────────────────
 
-// buildRoundTimeBoundaries infers the approximate game-time boundaries for each
-// round by looking at the min/max TimeSeconds across all kill events in that round.
-// These are approximate — used only to assign utterances to rounds.
 func buildRoundTimeBoundaries(parsed *ParseResult) map[int][2]float64 {
 	bounds := make(map[int][2]float64)
 	for _, ke := range parsed.KillEvents {
@@ -341,15 +445,12 @@ func buildRoundTimeBoundaries(parsed *ParseResult) map[int][2]float64 {
 	return expanded
 }
 
-// findRoundForTime returns the round number that best fits the given game time.
-// Falls back to the nearest round if no exact match.
 func findRoundForTime(t float64, bounds map[int][2]float64) int {
 	for round, b := range bounds {
 		if t >= b[0] && t <= b[1] {
 			return round
 		}
 	}
-	// Fallback: nearest round by distance to window
 	bestRound := 1
 	bestDist := math.MaxFloat64
 	for round, b := range bounds {
@@ -376,10 +477,8 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 		MergedAt:         time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// Build per-round event maps
 	roundEvents := make(map[int][]TimelineEvent)
 
-	// Add kill events
 	for _, ke := range parsed.KillEvents {
 		roundEvents[ke.RoundNumber] = append(roundEvents[ke.RoundNumber], TimelineEvent{
 			T:         ke.TimeSeconds,
@@ -394,9 +493,7 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 		})
 	}
 
-	// Add bomb events (no TimeSeconds in parser output, group by round only)
 	for _, be := range parsed.BombEvents {
-		// Only include meaningful bomb events
 		if be.EventType == "planted" || be.EventType == "defused" || be.EventType == "exploded" {
 			roundEvents[be.RoundNumber] = append(roundEvents[be.RoundNumber], TimelineEvent{
 				Kind:    be.EventType,
@@ -406,10 +503,8 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 		}
 	}
 
-	// Build round time boundaries for utterance assignment
 	roundBounds := buildRoundTimeBoundaries(parsed)
 
-	// Add utterances — convert recording-relative time to game time
 	for _, utt := range transcript.Utterances {
 		gameTime := utt.TStart - alignmentOffset
 		round := findRoundForTime(gameTime, roundBounds)
@@ -422,12 +517,10 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 		})
 	}
 
-	// Build sorted round list
 	var roundNums []int
 	for r := range roundEvents {
 		roundNums = append(roundNums, r)
 	}
-	// Also include rounds that had results but no kill events
 	for i := range parsed.Rounds {
 		rn := i + 1
 		if _, ok := roundEvents[rn]; !ok {
@@ -435,7 +528,6 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 		}
 		roundNums = append(roundNums, rn)
 	}
-	// Deduplicate and sort
 	seen := make(map[int]bool)
 	var uniqueRounds []int
 	for _, r := range roundNums {
@@ -449,7 +541,6 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 	for _, rn := range uniqueRounds {
 		events := roundEvents[rn]
 
-		// Sort events by time (bomb events with T=0 go to end of round)
 		sort.Slice(events, func(i, j int) bool {
 			if events[i].T == 0 && events[j].T != 0 {
 				return false
@@ -465,7 +556,6 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 			Events:   events,
 		}
 
-		// Attach round result if available
 		if rn-1 < len(parsed.Rounds) {
 			rr := parsed.Rounds[rn-1]
 			mr.WinReason = rr.WinReason
@@ -483,6 +573,11 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBucket, parserURL, matchID string) error {
 	prefix := "matches/" + matchID
 	log.Printf("Aligning match: %s", matchID)
+
+	// Set intermediate status so stuck detection works
+	if err := setStatus(ctx, client, voiceBucket, matchID, "aligning", nil); err != nil {
+		return fmt.Errorf("set aligning status: %w", err)
+	}
 
 	// Load transcript
 	var transcript TranscriptData
@@ -539,11 +634,11 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	}
 
 	// Update status
-	rawMeta["status"] = "pending_analysis"
-	rawMeta["timelineKey"] = prefix + "/timeline_merged.json"
-	rawMeta["mapName"] = parsed.MapName
-	rawMeta["demoKey"] = demoKey
-	if err := putJSON(ctx, client, voiceBucket, prefix+"/meta.json", rawMeta); err != nil {
+	if err := setStatus(ctx, client, voiceBucket, matchID, "pending_analysis", map[string]interface{}{
+		"timelineKey": prefix + "/timeline_merged.json",
+		"mapName":     parsed.MapName,
+		"demoKey":     demoKey,
+	}); err != nil {
 		return fmt.Errorf("update meta: %w", err)
 	}
 
@@ -576,7 +671,7 @@ func listPendingSessions(ctx context.Context, client *s3.Client, bucket string) 
 				continue
 			}
 			status, _ := rawMeta["status"].(string)
-			if status == "pending_alignment" || status == "aligning" {
+			if status == "pending_alignment" {
 				matchIDs = append(matchIDs, matchID)
 			}
 		}
@@ -587,9 +682,9 @@ func listPendingSessions(ctx context.Context, client *s3.Client, bucket string) 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	voiceBucket := os.Getenv("S3_BUCKET")          // cs2-voice-analytics
-	demoBucket := os.Getenv("DEMO_BUCKET")          // oldboyz-demo-bucket
-	parserURL := os.Getenv("PARSER_URL")            // e.g. https://your-parser.railway.app
+	voiceBucket := os.Getenv("S3_BUCKET")
+	demoBucket := os.Getenv("DEMO_BUCKET")
+	parserURL := os.Getenv("PARSER_URL")
 	pollInterval := 30 * time.Second
 
 	if voiceBucket == "" || demoBucket == "" || parserURL == "" {
@@ -609,6 +704,9 @@ func main() {
 	log.Printf("   Poll interval: %s", pollInterval)
 
 	for {
+		// Check for stuck sessions first
+		checkStaleSessions(ctx, client, voiceBucket)
+
 		pending, err := listPendingSessions(ctx, client, voiceBucket)
 		if err != nil {
 			log.Printf("List error: %v", err)
@@ -617,14 +715,9 @@ func main() {
 			for _, matchID := range pending {
 				if err := processSession(ctx, client, voiceBucket, demoBucket, parserURL, matchID); err != nil {
 					log.Printf("❌ Error processing %s: %v", matchID, err)
-					// Mark as error so it doesn't keep retrying
-					prefix := "matches/" + matchID
-					var rawMeta map[string]interface{}
-					if getErr := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &rawMeta); getErr == nil {
-						rawMeta["status"] = "error_alignment"
-						rawMeta["error"] = err.Error()
-						putJSON(ctx, client, voiceBucket, prefix+"/meta.json", rawMeta)
-					}
+					setStatus(ctx, client, voiceBucket, matchID, "error_alignment", map[string]interface{}{
+						"error": err.Error(),
+					})
 				}
 			}
 		}
