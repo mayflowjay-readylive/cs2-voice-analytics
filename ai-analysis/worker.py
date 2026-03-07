@@ -10,6 +10,7 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timezone
 
 import boto3
 from google import genai
@@ -23,6 +24,9 @@ S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
+STALE_THRESHOLD_SECONDS = 900  # 15 minutes
+MAX_RETRIES = 3
+
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 s3 = boto3.client(
@@ -32,6 +36,66 @@ s3 = boto3.client(
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     region_name=os.environ.get("AWS_REGION", "auto"),
 )
+
+
+# ─── Status helpers ───────────────────────────────────────────────────────────
+
+def get_meta(match_id: str) -> dict:
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=f"matches/{match_id}/meta.json")
+    return json.loads(obj["Body"].read())
+
+
+def set_status(match_id: str, status: str, extra: dict = None):
+    meta = get_meta(match_id)
+    meta["status"] = status
+    meta["statusUpdatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if extra:
+        meta.update(extra)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"matches/{match_id}/meta.json",
+        Body=json.dumps(meta, indent=2),
+        ContentType="application/json",
+    )
+
+
+# ─── Stuck session recovery ──────────────────────────────────────────────────
+
+def check_stale_sessions():
+    """Find sessions stuck in 'analyzing' and reset or error them."""
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="matches/", Delimiter="/"):
+        for prefix in page.get("CommonPrefixes", []):
+            match_prefix = prefix["Prefix"]
+            try:
+                obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
+                meta = json.loads(obj["Body"].read())
+                if meta.get("status") != "analyzing":
+                    continue
+
+                # Check staleness using statusUpdatedAt, fall back to S3 LastModified
+                updated_at = None
+                if meta.get("statusUpdatedAt"):
+                    updated_at = datetime.fromisoformat(meta["statusUpdatedAt"].replace("Z", "+00:00"))
+                else:
+                    updated_at = obj["LastModified"]
+
+                age = datetime.now(timezone.utc) - updated_at
+                if age.total_seconds() < STALE_THRESHOLD_SECONDS:
+                    continue
+
+                match_id = meta["matchId"]
+                retry_count = meta.get("retryCount", 0)
+
+                if retry_count >= MAX_RETRIES:
+                    log.warning(f"⛔ Session {match_id} stuck in 'analyzing' after {MAX_RETRIES} retries — marking as error")
+                    set_status(match_id, "error_analysis", {"error": f"Stuck in analyzing after {MAX_RETRIES} retries"})
+                else:
+                    log.warning(f"🔄 Session {match_id} stuck in 'analyzing' for {int(age.total_seconds())}s — resetting (retry {retry_count + 1}/{MAX_RETRIES})")
+                    set_status(match_id, "pending_analysis", {"retryCount": retry_count + 1})
+
+            except Exception:
+                pass
 
 
 # ─── Prompt builders ──────────────────────────────────────────────────────────
@@ -179,6 +243,9 @@ def process_session(match_id: str):
     log.info(f"Analysing match: {match_id}")
     prefix = f"matches/{match_id}"
 
+    # Set intermediate status so stuck detection works
+    set_status(match_id, "analyzing")
+
     # Load merged timeline
     obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{prefix}/timeline_merged.json")
     timeline = json.loads(obj["Body"].read())
@@ -224,16 +291,9 @@ def process_session(match_id: str):
     )
 
     # Update status → complete
-    obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{prefix}/meta.json")
-    meta = json.loads(obj["Body"].read())
-    meta["status"] = "complete"
-    meta["analysisKey"] = f"{prefix}/analysis.json"
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=f"{prefix}/meta.json",
-        Body=json.dumps(meta, indent=2),
-        ContentType="application/json",
-    )
+    set_status(match_id, "complete", {
+        "analysisKey": f"{prefix}/analysis.json",
+    })
 
     log.info(f"✅ Analysis complete for {match_id}")
 
@@ -258,6 +318,9 @@ def main():
     log.info(f"🤖 AI analysis worker started (model: {GEMINI_MODEL})")
     while True:
         try:
+            # Check for stuck sessions first
+            check_stale_sessions()
+
             pending = list_pending()
             if pending:
                 log.info(f"Found {len(pending)} pending session(s): {pending}")
@@ -266,18 +329,8 @@ def main():
                     process_session(match_id)
                 except Exception as e:
                     log.error(f"Error analysing {match_id}: {e}")
-                    # Mark as error so it doesn't keep retrying
                     try:
-                        obj = s3.get_object(Bucket=S3_BUCKET, Key=f"matches/{match_id}/meta.json")
-                        meta = json.loads(obj["Body"].read())
-                        meta["status"] = "error_analysis"
-                        meta["error"] = str(e)
-                        s3.put_object(
-                            Bucket=S3_BUCKET,
-                            Key=f"matches/{match_id}/meta.json",
-                            Body=json.dumps(meta, indent=2),
-                            ContentType="application/json",
-                        )
+                        set_status(match_id, "error_analysis", {"error": str(e)})
                     except Exception:
                         pass
         except Exception as e:
