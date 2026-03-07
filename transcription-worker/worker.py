@@ -15,6 +15,7 @@ import struct
 import wave
 import tempfile
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
 
 import boto3
 import opuslib
@@ -30,6 +31,9 @@ S3_BUCKET     = os.environ.get("S3_BUCKET", "")
 S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
+
+STALE_THRESHOLD_SECONDS = 900  # 15 minutes
+MAX_RETRIES = 3
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -278,11 +282,48 @@ def list_pending_sessions() -> list[str]:
             try:
                 obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
                 meta = json.loads(obj["Body"].read())
-                if meta.get("status") in ("pending_transcription", "transcribing"):
+                if meta.get("status") == "pending_transcription":
                     pending.append(meta["matchId"])
             except Exception:
                 pass
     return pending
+
+
+def check_stale_sessions():
+    """Find sessions stuck in 'transcribing' and reset or error them."""
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="matches/", Delimiter="/"):
+        for prefix in page.get("CommonPrefixes", []):
+            match_prefix = prefix["Prefix"]
+            try:
+                obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
+                meta = json.loads(obj["Body"].read())
+                if meta.get("status") != "transcribing":
+                    continue
+
+                # Check staleness using statusUpdatedAt, fall back to S3 LastModified
+                updated_at = None
+                if meta.get("statusUpdatedAt"):
+                    updated_at = datetime.fromisoformat(meta["statusUpdatedAt"].replace("Z", "+00:00"))
+                else:
+                    updated_at = obj["LastModified"]
+
+                age = datetime.now(timezone.utc) - updated_at
+                if age.total_seconds() < STALE_THRESHOLD_SECONDS:
+                    continue
+
+                match_id = meta["matchId"]
+                retry_count = meta.get("retryCount", 0)
+
+                if retry_count >= MAX_RETRIES:
+                    log.warning(f"⛔ Session {match_id} stuck in 'transcribing' after {MAX_RETRIES} retries — marking as error")
+                    set_status(match_id, "error_transcription", {"error": f"Stuck in transcribing after {MAX_RETRIES} retries"})
+                else:
+                    log.warning(f"🔄 Session {match_id} stuck in 'transcribing' for {int(age.total_seconds())}s — resetting (retry {retry_count + 1}/{MAX_RETRIES})")
+                    set_status(match_id, "pending_transcription", {"retryCount": retry_count + 1})
+
+            except Exception:
+                pass
 
 
 def get_meta(match_id: str) -> dict:
@@ -293,6 +334,7 @@ def get_meta(match_id: str) -> dict:
 def set_status(match_id: str, status: str, extra: dict = None):
     meta = get_meta(match_id)
     meta["status"] = status
+    meta["statusUpdatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if extra:
         meta.update(extra)
     s3.put_object(
@@ -380,6 +422,9 @@ def main():
     log.info("🎙️ Transcription worker started (Gemini)")
     while True:
         try:
+            # Check for stuck sessions first
+            check_stale_sessions()
+
             pending = list_pending_sessions()
             if pending:
                 log.info(f"Found {len(pending)} pending sessions: {pending}")
