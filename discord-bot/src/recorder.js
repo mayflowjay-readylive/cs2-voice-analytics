@@ -71,6 +71,13 @@ export class SessionRecorder {
 
       receiver.speaking.on("end", (userId) => {
         console.log(`🔇 Speaking end for ${userId}`);
+        // If we see an end event for a user we're not tracking,
+        // it means their start event fired during the DAVE delay.
+        // Start recording them so we catch their next utterance.
+        if (!this.receivers.has(userId)) {
+          console.log(`🔄 Missed start for ${userId} during DAVE delay — subscribing now`);
+          this._startUserRecording(userId, receiver, null, null);
+        }
       });
     }, DAVE_HANDSHAKE_DELAY_MS);
   }
