@@ -64,7 +64,8 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     console.log(`✅ Voice connection ready`);
   } catch {
-    console.warn("⚠️ Voice connection did not reach Ready state — continuing anyway");
+    connection.destroy();
+    throw new Error("Voice connection failed — could not reach Ready state within 30s. Check bot permissions in this channel.");
   }
 
   const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap });
