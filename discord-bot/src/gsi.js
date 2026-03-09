@@ -8,9 +8,9 @@ import {
 } from "@aws-sdk/client-s3";
 
 const PORT = process.env.PORT || 3000;
+const PHASE_WARMUP   = "warmup";
 const PHASE_LIVE     = "live";
 const PHASE_GAMEOVER = "gameover";
-const START_DELAY_MS = 0;
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "auto",
@@ -49,7 +49,7 @@ async function renameSession(oldMatchId, newMatchId) {
   console.log(`✅ Renamed session ${oldMatchId} → ${newMatchId}`);
 }
 
-export function startGsiServer({ onMatchStart, onMatchEnd }) {
+export function startGsiServer({ onWarmup, onMatchStart, onMatchEnd }) {
   const lastPhase = new Map();
 
   const server = http.createServer(async (req, res) => {
@@ -136,7 +136,7 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
         res.end("OK");
         try {
           const state = JSON.parse(body);
-          handleGsiEvent(state, lastPhase, onMatchStart, onMatchEnd);
+          handleGsiEvent(state, lastPhase, onWarmup, onMatchStart, onMatchEnd);
         } catch (err) {
           console.error("[GSI] Failed to parse payload:", err.message);
         }
@@ -155,7 +155,7 @@ export function startGsiServer({ onMatchStart, onMatchEnd }) {
   return server;
 }
 
-function handleGsiEvent(state, lastPhase, onMatchStart, onMatchEnd) {
+function handleGsiEvent(state, lastPhase, onWarmup, onMatchStart, onMatchEnd) {
   const steamId  = state.provider?.steamid;
   const mapPhase = state.map?.phase;
   const matchId  = state.map?.matchid || generateMatchId(state);
@@ -164,11 +164,20 @@ function handleGsiEvent(state, lastPhase, onMatchStart, onMatchEnd) {
   if (prev === mapPhase) return;
   lastPhase.set(steamId, mapPhase);
   console.log(`[GSI] steamId=${steamId} phase: ${prev ?? "unknown"} → ${mapPhase}`);
-  if (mapPhase === PHASE_LIVE && prev !== PHASE_LIVE) {
-    const startedAt = Date.now() - START_DELAY_MS;
-    setTimeout(() => { onMatchStart({ matchId, steamId, startedAt, source: "gsi" }); }, START_DELAY_MS);
+
+  // Warmup phase — pre-connect to voice channel so DAVE handshake completes before round 1
+  if (mapPhase === PHASE_WARMUP && prev !== PHASE_WARMUP) {
+    onWarmup({ matchId, steamId, source: "gsi" });
   }
-  if (mapPhase === PHASE_GAMEOVER && prev === PHASE_LIVE) {
+
+  // Live phase — start recording (connection should already be established from warmup)
+  if (mapPhase === PHASE_LIVE && prev !== PHASE_LIVE) {
+    const startedAt = Date.now();
+    onMatchStart({ matchId, steamId, startedAt, source: "gsi" });
+  }
+
+  // Game over — stop recording and upload
+  if (mapPhase === PHASE_GAMEOVER && (prev === PHASE_LIVE || prev === PHASE_WARMUP)) {
     onMatchEnd({ matchId, steamId, source: "gsi" });
   }
 }
