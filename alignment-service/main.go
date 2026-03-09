@@ -2,9 +2,9 @@
 //
 // Polls cs2-voice-analytics bucket for sessions with status=pending_alignment.
 // For each session:
-//   1. Finds the matching .dem file in oldboyz-demo-bucket by timestamp proximity
-//   2. Generates a presigned URL for the demo
-//   3. POSTs that URL to the demo parser service
+//   1. Checks if parse_result.json already exists (written by Lovable process-match)
+//   2. If not, finds the matching .dem file in oldboyz-demo-bucket by timestamp proximity
+//   3. Generates a presigned URL for the demo and POSTs it to the demo parser service
 //   4. Merges ParseResult + transcript into a per-round timeline
 //   5. Writes timeline_merged.json and advances status to pending_analysis
 
@@ -57,7 +57,7 @@ type KillEvent struct {
 type BombEvent struct {
 	RoundNumber   int    `json:"roundNumber"`
 	Tick          int    `json:"tick"`
-	EventType     string `json:"eventType"` // plant_begin, planted, defuse_begin, defused, exploded
+	EventType     string `json:"eventType"`
 	PlayerSteamID string `json:"playerSteamId"`
 	Site          string `json:"site"`
 }
@@ -201,6 +201,16 @@ func putJSON(ctx context.Context, client *s3.Client, bucket, key string, v any) 
 	return err
 }
 
+// ─── Check if a key exists in S3 ─────────────────────────────────────────────
+
+func objectExists(ctx context.Context, client *s3.Client, bucket, key string) bool {
+	_, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	return err == nil
+}
+
 // ─── Status helpers ───────────────────────────────────────────────────────────
 
 func setStatus(ctx context.Context, client *s3.Client, bucket, matchID, status string, extra map[string]interface{}) error {
@@ -242,7 +252,6 @@ func checkStaleSessions(ctx context.Context, client *s3.Client, bucket string) {
 				continue
 			}
 
-			// Check staleness
 			var updatedAt time.Time
 			if ts, ok := rawMeta["statusUpdatedAt"].(string); ok && ts != "" {
 				if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
@@ -250,7 +259,6 @@ func checkStaleSessions(ctx context.Context, client *s3.Client, bucket string) {
 				}
 			}
 			if updatedAt.IsZero() {
-				// Fallback: use S3 object LastModified
 				head, err := client.HeadObject(ctx, &s3.HeadObjectInput{
 					Bucket: aws.String(bucket),
 					Key:    aws.String("matches/" + matchID + "/meta.json"),
@@ -288,9 +296,6 @@ func checkStaleSessions(ctx context.Context, client *s3.Client, bucket string) {
 
 // ─── Find matching demo in oldboyz-demo-bucket ────────────────────────────────
 
-// Demo files are named: demo_{timestampMs}_{random}.dem
-// We match by finding the demo whose timestamp is closest to recordingStartMs,
-// within a ±30 minute window.
 func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string, recordingStartMs int64) (string, error) {
 	var allKeys []string
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
@@ -309,15 +314,14 @@ func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string,
 	}
 
 	if len(allKeys) == 0 {
-		return "", fmt.Errorf("⚠️ NO DEMO FILES FOUND — demo bucket '%s' is empty. Make sure demos are being uploaded", demoBucket)
+		return "", fmt.Errorf("no demo files found in bucket '%s'", demoBucket)
 	}
 
 	bestKey := ""
 	bestDelta := int64(math.MaxInt64)
-	windowMs := int64(30 * 60 * 1000) // 30 minutes
+	windowMs := int64(30 * 60 * 1000)
 
 	for _, key := range allKeys {
-		// Parse timestamp from filename: demo_{timestamp}_{random}.dem
 		base := strings.TrimSuffix(key, ".dem")
 		parts := strings.Split(base, "_")
 		if len(parts) < 2 {
@@ -338,7 +342,6 @@ func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string,
 	}
 
 	if bestKey == "" {
-		// Build a helpful error message showing what demos ARE available
 		log.Printf("════════════════════════════════════════════════════════════")
 		log.Printf("⚠️  NO MATCHING DEMO FOUND")
 		log.Printf("   Recording started at: %d (%s)", recordingStartMs, time.UnixMilli(recordingStartMs).UTC().Format(time.RFC3339))
@@ -433,7 +436,6 @@ func buildRoundTimeBoundaries(parsed *ParseResult) map[int][2]float64 {
 			bounds[ke.RoundNumber] = b
 		}
 	}
-	// Expand each round window: start 2 minutes before first kill, end 30s after last
 	expanded := make(map[int][2]float64)
 	for round, b := range bounds {
 		start := b[0] - 120.0
@@ -574,7 +576,7 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	prefix := "matches/" + matchID
 	log.Printf("Aligning match: %s", matchID)
 
-	// Set intermediate status so stuck detection works
+	// Set intermediate status
 	if err := setStatus(ctx, client, voiceBucket, matchID, "aligning", nil); err != nil {
 		return fmt.Errorf("set aligning status: %w", err)
 	}
@@ -586,7 +588,7 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	}
 	log.Printf("  Transcript: %d utterances, recordingStartMs=%d", len(transcript.Utterances), transcript.RecordingStartMs)
 
-	// Load meta for recordingStartMs (may differ from transcript if GSI timing)
+	// Load meta for recordingStartMs
 	var rawMeta map[string]interface{}
 	if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &rawMeta); err != nil {
 		return fmt.Errorf("load meta: %w", err)
@@ -599,30 +601,48 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 		}
 	}
 
-	// Find matching demo
-	demoKey, err := findMatchingDemo(ctx, client, demoBucket, recordingStartMs)
-	if err != nil {
-		return fmt.Errorf("find demo: %w", err)
+	// ── Try to load pre-existing parse_result.json (written by Lovable process-match) ──
+	var parsed *ParseResult
+	parseResultKey := prefix + "/parse_result.json"
+	if objectExists(ctx, client, voiceBucket, parseResultKey) {
+		log.Printf("  ✅ Found pre-existing parse_result.json — skipping demo search")
+		var pr ParseResult
+		if err := getJSON(ctx, client, voiceBucket, parseResultKey, &pr); err != nil {
+			log.Printf("  ⚠️ Failed to load parse_result.json, falling back to demo search: %v", err)
+		} else {
+			parsed = &pr
+			log.Printf("  Loaded: map=%s, rounds=%d, kills=%d", parsed.MapName, len(parsed.Rounds), len(parsed.KillEvents))
+		}
 	}
 
-	// Generate presigned URL
-	demoURL, err := presignDemoURL(ctx, client, demoBucket, demoKey)
-	if err != nil {
-		return fmt.Errorf("presign demo: %w", err)
+	// ── Fallback: find and parse demo from R2 ──
+	if parsed == nil {
+		log.Printf("  No parse_result.json found — searching for demo in %s...", demoBucket)
+
+		demoKey, err := findMatchingDemo(ctx, client, demoBucket, recordingStartMs)
+		if err != nil {
+			return fmt.Errorf("find demo: %w", err)
+		}
+
+		demoURL, err := presignDemoURL(ctx, client, demoBucket, demoKey)
+		if err != nil {
+			return fmt.Errorf("presign demo: %w", err)
+		}
+
+		log.Printf("  Calling parser for %s...", demoKey)
+		parsed, err = callDemoParser(parserURL, demoURL)
+		if err != nil {
+			return fmt.Errorf("parse demo: %w", err)
+		}
+		log.Printf("  Parsed: map=%s, rounds=%d, kills=%d", parsed.MapName, len(parsed.Rounds), len(parsed.KillEvents))
+
+		// Save parse result for future use
+		if err := putJSON(ctx, client, voiceBucket, parseResultKey, parsed); err != nil {
+			log.Printf("  ⚠️ Failed to save parse_result.json (non-fatal): %v", err)
+		}
 	}
 
-	// Call demo parser
-	log.Printf("  Calling parser for %s...", demoKey)
-	parsed, err := callDemoParser(parserURL, demoURL)
-	if err != nil {
-		return fmt.Errorf("parse demo: %w", err)
-	}
-	log.Printf("  Parsed: map=%s, rounds=%d, kills=%d", parsed.MapName, len(parsed.Rounds), len(parsed.KillEvents))
-
-	// Alignment offset:
-	// With GSI auto-start, recording starts when map.phase=live which is
-	// the same zero point as demo match start, so offset = 0.
-	// For manual /match start there's a small human delay but it's acceptable.
+	// Alignment offset
 	alignmentOffset := 0.0
 
 	// Build merged timeline
@@ -634,10 +654,14 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	}
 
 	// Update status
+	demoSource := "parse_result.json"
+	if _, ok := rawMeta["demoKey"]; ok {
+		demoSource = "demo_bucket"
+	}
 	if err := setStatus(ctx, client, voiceBucket, matchID, "pending_analysis", map[string]interface{}{
 		"timelineKey": prefix + "/timeline_merged.json",
 		"mapName":     parsed.MapName,
-		"demoKey":     demoKey,
+		"demoSource":  demoSource,
 	}); err != nil {
 		return fmt.Errorf("update meta: %w", err)
 	}
@@ -704,7 +728,6 @@ func main() {
 	log.Printf("   Poll interval: %s", pollInterval)
 
 	for {
-		// Check for stuck sessions first
 		checkStaleSessions(ctx, client, voiceBucket)
 
 		pending, err := listPendingSessions(ctx, client, voiceBucket)
