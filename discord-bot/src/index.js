@@ -169,6 +169,7 @@ startGsiServer({
   // Warmup: pre-connect to voice channel so DAVE handshake completes before round 1
   onWarmup: async ({ matchId, steamId }) => {
     if (!client.isReady()) return;
+    if (!(await isBotEnabled())) { console.log(`[GSI] Warmup: Bot disabled — skipping`); return; }
     const location = findVoiceChannelForSteam(steamId);
     if (!location) { console.log(`[GSI] Warmup: ${steamId} not in any voice channel — skipping`); return; }
     const { guild, channel } = location;
@@ -192,6 +193,7 @@ startGsiServer({
   // Live: start recording (use pre-existing connection if available)
   onMatchStart: async ({ matchId, steamId, startedAt }) => {
     if (!client.isReady()) return;
+    if (!(await isBotEnabled())) { console.log(`[GSI] Live: Bot disabled — skipping`); return; }
     const location = findVoiceChannelForSteam(steamId);
     if (!location) { console.log(`[GSI] ${steamId} not in any voice channel — skipping`); return; }
     const { guild, channel } = location;
