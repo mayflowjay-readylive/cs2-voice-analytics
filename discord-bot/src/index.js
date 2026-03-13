@@ -19,7 +19,7 @@ client.on("error", (err) => {
 });
 
 const activeSessions = new Map();
-const pendingConnections = new Map(); // guildId → { connection, voiceChannel, playerMap }
+const pendingConnections = new Map();
 const steamToDiscord = new Map();
 
 // ─── Persist Steam→Discord links ─────────────────────────────────────────────
@@ -47,6 +47,21 @@ function saveLinks() {
     writeFileSync(LINKS_FILE, JSON.stringify(Object.fromEntries(steamToDiscord), null, 2));
   } catch (err) {
     console.warn("Could not save links file:", err.message);
+  }
+}
+
+// ─── Bot enabled check ────────────────────────────────────────────────────
+
+const VOICE_API_URL = process.env.VOICE_API_URL || "https://voice-api-production-d2f7.up.railway.app";
+
+async function isBotEnabled() {
+  try {
+    const resp = await fetch(`${VOICE_API_URL}/bot/enabled`);
+    if (!resp.ok) return true;
+    const data = await resp.json();
+    return data.enabled !== false;
+  } catch {
+    return true;
   }
 }
 
@@ -86,7 +101,6 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
   let connection = existingConnection;
 
   if (!connection) {
-    // No pre-existing connection (manual /match start) — connect now
     connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId,
@@ -148,25 +162,9 @@ function findVoiceChannelForSteam(steamId) {
   return null;
 }
 
-// ─── Bot enabled check ────────────────────────────────────────────────────
-
-const VOICE_API_URL = process.env.VOICE_API_URL || "https://voice-api-production-d2f7.up.railway.app";
-
-async function isBotEnabled() {
-  try {
-    const resp = await fetch(`${VOICE_API_URL}/bot/enabled`);
-    if (!resp.ok) return true; // Default to enabled on error
-    const data = await resp.json();
-    return data.enabled !== false;
-  } catch {
-    return true; // Default to enabled if API unreachable
-  }
-}
-
 // ─── GSI ──────────────────────────────────────────────────────────────────────
 
 startGsiServer({
-  // Warmup: pre-connect to voice channel so DAVE handshake completes before round 1
   onWarmup: async ({ matchId, steamId }) => {
     if (!client.isReady()) return;
     if (!(await isBotEnabled())) { console.log(`[GSI] Warmup: Bot disabled — skipping`); return; }
@@ -175,7 +173,6 @@ startGsiServer({
     const { guild, channel } = location;
     const guildId = guild.id;
 
-    // Already recording or already pre-connected
     if (activeSessions.has(guildId)) { console.log(`[GSI] Warmup: Already recording — ignoring`); return; }
     if (pendingConnections.has(guildId)) { console.log(`[GSI] Warmup: Already pre-connected — ignoring`); return; }
 
@@ -190,7 +187,6 @@ startGsiServer({
     }
   },
 
-  // Live: start recording (use pre-existing connection if available)
   onMatchStart: async ({ matchId, steamId, startedAt }) => {
     if (!client.isReady()) return;
     if (!(await isBotEnabled())) { console.log(`[GSI] Live: Bot disabled — skipping`); return; }
@@ -200,7 +196,6 @@ startGsiServer({
     const guildId = guild.id;
     if (activeSessions.has(guildId)) { console.log(`[GSI] Already recording — ignoring`); return; }
 
-    // Check for pre-existing connection from warmup
     const pending = pendingConnections.get(guildId);
     pendingConnections.delete(guildId);
 
@@ -208,7 +203,6 @@ startGsiServer({
     let playerMap;
 
     if (pending) {
-      // Check if the pre-connected connection is still alive
       if (pending.connection.state.status === "ready") {
         console.log(`[GSI] Using pre-connected voice channel from warmup (connection still ready)`);
         existingConnection = pending.connection;
@@ -217,7 +211,6 @@ startGsiServer({
         try { pending.connection.destroy(); } catch {}
         existingConnection = null;
       }
-      // Rebuild player map in case people joined during warmup
       playerMap = buildPlayerMap(channel, "gsi");
     } else {
       console.log(`[GSI] No warmup pre-connection — connecting now`);
@@ -231,14 +224,12 @@ startGsiServer({
     }
   },
 
-  // Game over: stop recording
   onMatchEnd: async ({ matchId, steamId }) => {
     if (!client.isReady()) return;
     const location = findVoiceChannelForSteam(steamId);
     if (!location) return;
     const guildId = location.guild.id;
 
-    // Clean up pending connection if match ended without going live (e.g. cancelled during warmup)
     if (pendingConnections.has(guildId)) {
       const pending = pendingConnections.get(guildId);
       pendingConnections.delete(guildId);
@@ -322,7 +313,6 @@ client.on("interactionCreate", async (interaction) => {
         const voiceChannel = member.voice?.channel;
         if (!voiceChannel) return interaction.editReply("❌ You must be in a voice channel to start recording.");
 
-        // Clean up any pending GSI connection if manual start is used
         if (pendingConnections.has(guildId)) {
           const pending = pendingConnections.get(guildId);
           pendingConnections.delete(guildId);
@@ -357,7 +347,6 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       else if (sub === "cancel") {
-        // Clean up pending connection if exists
         if (pendingConnections.has(guildId)) {
           const pending = pendingConnections.get(guildId);
           pendingConnections.delete(guildId);
