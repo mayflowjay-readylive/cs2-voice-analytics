@@ -148,6 +148,21 @@ function findVoiceChannelForSteam(steamId) {
   return null;
 }
 
+// ─── Bot enabled check ────────────────────────────────────────────────────
+
+const VOICE_API_URL = process.env.VOICE_API_URL || "https://voice-api-production-d2f7.up.railway.app";
+
+async function isBotEnabled() {
+  try {
+    const resp = await fetch(`${VOICE_API_URL}/bot/enabled`);
+    if (!resp.ok) return true; // Default to enabled on error
+    const data = await resp.json();
+    return data.enabled !== false;
+  } catch {
+    return true; // Default to enabled if API unreachable
+  }
+}
+
 // ─── GSI ──────────────────────────────────────────────────────────────────────
 
 startGsiServer({
@@ -191,8 +206,15 @@ startGsiServer({
     let playerMap;
 
     if (pending) {
-      console.log(`[GSI] Using pre-connected voice channel from warmup`);
-      existingConnection = pending.connection;
+      // Check if the pre-connected connection is still alive
+      if (pending.connection.state.status === "ready") {
+        console.log(`[GSI] Using pre-connected voice channel from warmup (connection still ready)`);
+        existingConnection = pending.connection;
+      } else {
+        console.log(`[GSI] Pre-connected voice was ${pending.connection.state.status} — reconnecting`);
+        try { pending.connection.destroy(); } catch {}
+        existingConnection = null;
+      }
       // Rebuild player map in case people joined during warmup
       playerMap = buildPlayerMap(channel, "gsi");
     } else {
