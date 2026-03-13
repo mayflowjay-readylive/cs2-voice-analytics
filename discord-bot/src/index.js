@@ -50,7 +50,7 @@ function saveLinks() {
   }
 }
 
-// ─── Bot enabled check ────────────────────────────────────────────────────
+// ─── Voice API helpers ────────────────────────────────────────────────────────
 
 const VOICE_API_URL = process.env.VOICE_API_URL || "https://voice-api-production-d2f7.up.railway.app";
 
@@ -62,6 +62,18 @@ async function isBotEnabled() {
     return data.enabled !== false;
   } catch {
     return true;
+  }
+}
+
+async function getExcludedDiscordIds() {
+  try {
+    const resp = await fetch(`${VOICE_API_URL}/bot/excluded-players`);
+    if (!resp.ok) return new Set();
+    const data = await resp.json();
+    const players = data.players || [];
+    return new Set(players.map(p => p.discordId).filter(Boolean));
+  } catch {
+    return new Set();
   }
 }
 
@@ -97,7 +109,7 @@ async function preconnectVoice({ guildId, voiceChannel }) {
   return connection;
 }
 
-async function startRecording({ guildId, voiceChannel, matchId, playerMap, startedAt, existingConnection }) {
+async function startRecording({ guildId, voiceChannel, matchId, playerMap, startedAt, existingConnection, excludedDiscordIds }) {
   let connection = existingConnection;
 
   if (!connection) {
@@ -118,7 +130,7 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     }
   }
 
-  const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap });
+  const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds });
   recorder.start();
 
   activeSessions.set(guildId, { recorder, matchId, startedAt: startedAt ?? Date.now() });
@@ -217,8 +229,14 @@ startGsiServer({
       playerMap = buildPlayerMap(channel, "gsi");
     }
 
+    // Fetch excluded players
+    const excludedDiscordIds = await getExcludedDiscordIds();
+    if (excludedDiscordIds.size > 0) {
+      console.log(`[GSI] Excluding ${excludedDiscordIds.size} player(s) from recording`);
+    }
+
     try {
-      await startRecording({ guildId, voiceChannel: channel, matchId, playerMap, startedAt, existingConnection });
+      await startRecording({ guildId, voiceChannel: channel, matchId, playerMap, startedAt, existingConnection, excludedDiscordIds });
     } catch (err) {
       console.error(`[GSI] Failed to auto-start:`, err.message);
     }
@@ -327,7 +345,12 @@ client.on("interactionCreate", async (interaction) => {
           if (sid && did) playerMap[did] = sid;
         }
 
-        await startRecording({ guildId, voiceChannel, matchId, playerMap });
+        const excludedDiscordIds = await getExcludedDiscordIds();
+        if (excludedDiscordIds.size > 0) {
+          console.log(`Excluding ${excludedDiscordIds.size} player(s) from recording`);
+        }
+
+        await startRecording({ guildId, voiceChannel, matchId, playerMap, excludedDiscordIds });
 
         const humanPlayerCount = voiceChannel.members.size - 1;
         return interaction.editReply(
