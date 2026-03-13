@@ -47,6 +47,7 @@ func main() {
 	mux.HandleFunc("/rounds/", handleRounds)
 	mux.HandleFunc("/status/", handleStatus)
 	mux.HandleFunc("/sessions/link", handleSessionsLink)
+	mux.HandleFunc("/bot/enabled", handleBotEnabled)
 
 	handler := corsMiddleware(mux)
 
