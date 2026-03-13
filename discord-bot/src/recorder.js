@@ -12,26 +12,30 @@ import { EndBehaviorType } from "@discordjs/voice";
 // compressed continuous speech, making round-level alignment impossible.
 
 const DAVE_HANDSHAKE_DELAY_MS = 3000;
-const OPUS_FRAME_DURATION_MS = 20; // Each Opus frame = 20ms
-const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]); // Opus silence frame (stereo, 20ms)
+const OPUS_FRAME_DURATION_MS = 20;
+const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
 
 export class SessionRecorder {
-  constructor({ matchId, connection, voiceChannel, playerMap }) {
+  constructor({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds }) {
     this.matchId = matchId;
     this.connection = connection;
     this.voiceChannel = voiceChannel;
     this.playerMap = playerMap;
+    this.excludedDiscordIds = excludedDiscordIds || new Set();
     this.tmpDir = join(os.tmpdir(), `cs2-match-${matchId}`);
     mkdirSync(this.tmpDir, { recursive: true });
     this.receivers = new Map();
     this.audioFiles = [];
-    this.recordingStartTime = null; // Set when recording actually starts
+    this.recordingStartTime = null;
   }
 
   start() {
     const receiver = this.connection.receiver;
     console.log(`🎧 Receiver attached, waiting for speaking events...`);
     console.log(`🔌 Connection state: ${this.connection.state.status}`);
+    if (this.excludedDiscordIds.size > 0) {
+      console.log(`🚫 Excluded Discord IDs: ${[...this.excludedDiscordIds].join(", ")}`);
+    }
 
     this.connection.on("error", (err) => {
       console.warn(`⚠️ Voice connection error (suppressed): ${err.message}`);
@@ -48,6 +52,11 @@ export class SessionRecorder {
       this.recordingStartTime = Date.now();
 
       receiver.speaking.on("start", (userId) => {
+        // Check exclusion list
+        if (this.excludedDiscordIds.has(userId)) {
+          return;
+        }
+
         console.log(`🗣️ Speaking start detected for ${userId}`);
 
         if (this.receivers.has(userId)) {
@@ -69,6 +78,11 @@ export class SessionRecorder {
       });
 
       receiver.speaking.on("end", (userId) => {
+        // Check exclusion list
+        if (this.excludedDiscordIds.has(userId)) {
+          return;
+        }
+
         console.log(`🔇 Speaking end for ${userId}`);
         if (!this.receivers.has(userId)) {
           console.log(`🔄 Missed start for ${userId} during DAVE delay — subscribing now`);
@@ -96,7 +110,6 @@ export class SessionRecorder {
 
     const writeStream = createWriteStream(filePath, { flags: isReconnect ? "a" : "w" });
 
-    // Track timing for silence injection
     let lastPacketTime = existingLastPacketTime || Date.now();
     let isFirstPacket = !isReconnect;
 
@@ -104,12 +117,9 @@ export class SessionRecorder {
       const now = Date.now();
 
       if (isFirstPacket) {
-        // For the first packet, inject silence from recording start to now
-        // so this user's audio is aligned to the recording timeline
         const silenceMs = now - this.recordingStartTime;
         if (silenceMs > OPUS_FRAME_DURATION_MS) {
           const silenceFrames = Math.floor(silenceMs / OPUS_FRAME_DURATION_MS);
-          // Cap at reasonable amount (max 10 minutes of leading silence = 30000 frames)
           const framesToWrite = Math.min(silenceFrames, 30000);
           for (let i = 0; i < framesToWrite; i++) {
             this._writePacket(writeStream, SILENCE_FRAME);
@@ -119,16 +129,12 @@ export class SessionRecorder {
         isFirstPacket = false;
         lastPacketTime = now;
       } else {
-        // Inject silence frames for gaps between speech segments
         const gapMs = now - lastPacketTime;
         if (gapMs > OPUS_FRAME_DURATION_MS * 2) {
-          // Subtract one frame duration since the current packet covers some time
           const silenceMs = gapMs - OPUS_FRAME_DURATION_MS;
           const silenceFrames = Math.floor(silenceMs / OPUS_FRAME_DURATION_MS);
-          // Cap at 60 seconds of silence (3000 frames) — longer gaps are unusual
           const framesToWrite = Math.min(silenceFrames, 3000);
           if (framesToWrite > 5) {
-            // Only inject if gap is meaningful (>100ms)
             for (let i = 0; i < framesToWrite; i++) {
               this._writePacket(writeStream, SILENCE_FRAME);
             }
@@ -136,7 +142,6 @@ export class SessionRecorder {
         }
       }
 
-      // Write the actual audio packet
       this._writePacket(writeStream, packet);
       lastPacketTime = now;
     });
