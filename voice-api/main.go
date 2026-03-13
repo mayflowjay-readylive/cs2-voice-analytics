@@ -48,6 +48,7 @@ func main() {
 	mux.HandleFunc("/status/", handleStatus)
 	mux.HandleFunc("/sessions/link", handleSessionsLink)
 	mux.HandleFunc("/bot/enabled", handleBotEnabled)
+	mux.HandleFunc("/bot/excluded-players", handleExcludedPlayers)
 
 	handler := corsMiddleware(mux)
 
@@ -233,7 +234,6 @@ func handleBotEnabled(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		data, err := getR2Json(ctx, configKey)
 		if err != nil {
-			// Default to enabled if config doesn't exist
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(200)
 			json.NewEncoder(w).Encode(map[string]interface{}{"enabled": true})
@@ -272,6 +272,64 @@ func handleBotEnabled(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(data)
+		return
+	}
+
+	http.Error(w, `{"error":"method not allowed"}`, 405)
+}
+
+// ─── /bot/excluded-players handler ────────────────────────────────────────
+
+func handleExcludedPlayers(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	configKey := "config/excluded_players.json"
+
+	if r.Method == "GET" {
+		data, err := getR2Json(ctx, configKey)
+		if err != nil {
+			// No exclusions yet
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]interface{}{"players": []interface{}{}})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(data)
+		return
+	}
+
+	// POST — expects { "players": [{ "discordId": "...", "steamId": "...", "name": "..." }, ...] }
+	if r.Method == "POST" {
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+
+		req["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
+
+		if err := putR2Json(ctx, configKey, req); err != nil {
+			log.Printf("[excluded-players] Failed to save: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		log.Printf("🚫 Excluded players updated")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(req)
 		return
 	}
 
