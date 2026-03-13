@@ -376,6 +376,67 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ─── /bot/enabled handler ─────────────────────────────────────────────────
+
+func handleBotEnabled(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	configKey := "config/bot_enabled.json"
+
+	if r.Method == "GET" {
+		data, err := getR2Json(ctx, configKey)
+		if err != nil {
+			// Default to enabled if config doesn't exist
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]interface{}{"enabled": true})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(data)
+		return
+	}
+
+	if r.Method == "POST" {
+		var req struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+
+		data := map[string]interface{}{
+			"enabled":   req.Enabled,
+			"updatedAt": time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := putR2Json(ctx, configKey, data); err != nil {
+			log.Printf("[bot/enabled] Failed to save: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		log.Printf("🤖 Bot enabled set to: %v", req.Enabled)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(data)
+		return
+	}
+
+	http.Error(w, `{"error":"method not allowed"}`, 405)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 func extractMatchID(path, prefix string) string {
