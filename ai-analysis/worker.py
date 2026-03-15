@@ -73,7 +73,6 @@ def check_stale_sessions():
                 if meta.get("status") != "analyzing":
                     continue
 
-                # Check staleness using statusUpdatedAt, fall back to S3 LastModified
                 updated_at = None
                 if meta.get("statusUpdatedAt"):
                     updated_at = datetime.fromisoformat(meta["statusUpdatedAt"].replace("Z", "+00:00"))
@@ -104,7 +103,7 @@ def build_player_context(timeline: dict) -> dict:
     """Build a steamId → Player_N alias map from all events in the timeline."""
     steam_ids = set()
     for round_ in timeline.get("rounds", []):
-        for ev in round_.get("events", []):
+        for ev in (round_.get("events") or []):
             if ev.get("steamId"):
                 steam_ids.add(ev["steamId"])
     return {sid: f"Player_{i+1}" for i, sid in enumerate(sorted(steam_ids))}
@@ -117,7 +116,7 @@ def render_round_for_prompt(round_: dict, player_names: dict) -> str:
 
     lines = [f"--- Round {round_num} (winner: team {winner}, reason: {win_reason}) ---"]
 
-    for ev in round_.get("events", []):
+    for ev in (round_.get("events") or []):
         t = ev.get("t", 0)
         pid = player_names.get(ev.get("steamId", ""), ev.get("steamId", "?"))
         kind = ev.get("type", "")
@@ -158,8 +157,20 @@ Your JSON must match this schema exactly:
 
 For miscommunications: compare what a player said they would do vs what the demo shows they did.
 For IGL: look for imperative language, strategy calls, role assignments.
-For toxicity: look for blame, insults, tilted/negative comments after deaths.
+
+CRITICAL — Toxicity detection guidelines (be VERY conservative):
+- Danish gaming culture is naturally blunt, sarcastic, and uses dark humor. This is NORMAL, not toxic.
+- Sarcasm praising a teammate ("he would have aced them all with his Deagle") is NOT toxic — it's a compliment wrapped in humor.
+- Expressing disappointment about losing a round ("that's so annoying", "ugh", "hvor er det ærgerligt") is NOT toxic — it's normal emotional expression.
+- Friendly banter, teasing, and joking at each other's expense is NOT toxic — it's team bonding.
+- Swearing in frustration at the situation (not directed at a teammate) is NOT toxic.
+- ONLY flag as toxic: direct personal insults aimed at a specific teammate with intent to hurt, sustained harassment or bullying, telling someone to shut up or stop playing, rage-quitting threats, or discriminatory language.
+- When in doubt, it is NOT toxic. False positives are worse than false negatives here.
+- An empty toxic_utterances array is the expected outcome for most rounds.
+
 For info quality: rate how useful each player's callouts were (positions, counts, utility status).
+
+For motivating_moments: include genuine encouragement, hype after good plays, compliments (even sarcastic ones that are clearly positive in intent), and expressions of shared team emotion (both positive and empathetic disappointment).
 """
 
 MATCH_SUMMARY_SYSTEM = """You are an expert CS2 communication analyst.
@@ -208,8 +219,10 @@ def gemini_json(prompt: str) -> dict:
 
 
 def analyse_round(round_: dict, player_names: dict) -> dict:
+    events = round_.get("events") or []
+
     # Skip rounds with no voice comms
-    has_comms = any(ev.get("type") == "utterance" for ev in round_.get("events", []))
+    has_comms = any(ev.get("type") == "utterance" for ev in events)
     if not has_comms:
         return {
             "igl_candidate": None,
@@ -243,7 +256,7 @@ def process_session(match_id: str):
     log.info(f"Analysing match: {match_id}")
     prefix = f"matches/{match_id}"
 
-    # Set intermediate status so stuck detection works
+    # Set intermediate status
     set_status(match_id, "analyzing")
 
     # Load merged timeline
