@@ -482,6 +482,9 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 	roundEvents := make(map[int][]TimelineEvent)
 
 	for _, ke := range parsed.KillEvents {
+		if ke.RoundNumber <= 0 {
+			continue
+		}
 		roundEvents[ke.RoundNumber] = append(roundEvents[ke.RoundNumber], TimelineEvent{
 			T:         ke.TimeSeconds,
 			Kind:      "kill",
@@ -496,6 +499,9 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 	}
 
 	for _, be := range parsed.BombEvents {
+		if be.RoundNumber <= 0 {
+			continue
+		}
 		if be.EventType == "planted" || be.EventType == "defused" || be.EventType == "exploded" {
 			roundEvents[be.RoundNumber] = append(roundEvents[be.RoundNumber], TimelineEvent{
 				Kind:    be.EventType,
@@ -510,6 +516,9 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 	for _, utt := range transcript.Utterances {
 		gameTime := utt.TStart - alignmentOffset
 		round := findRoundForTime(gameTime, roundBounds)
+		if round <= 0 {
+			round = 1
+		}
 		roundEvents[round] = append(roundEvents[round], TimelineEvent{
 			T:          gameTime,
 			Kind:       "utterance",
@@ -521,7 +530,9 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 
 	var roundNums []int
 	for r := range roundEvents {
-		roundNums = append(roundNums, r)
+		if r > 0 {
+			roundNums = append(roundNums, r)
+		}
 	}
 	for i := range parsed.Rounds {
 		rn := i + 1
@@ -533,7 +544,7 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 	seen := make(map[int]bool)
 	var uniqueRounds []int
 	for _, r := range roundNums {
-		if !seen[r] {
+		if !seen[r] && r > 0 {
 			seen[r] = true
 			uniqueRounds = append(uniqueRounds, r)
 		}
@@ -558,7 +569,7 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 			Events:   events,
 		}
 
-		if rn-1 < len(parsed.Rounds) {
+		if rn > 0 && rn-1 < len(parsed.Rounds) {
 			rr := parsed.Rounds[rn-1]
 			mr.WinReason = rr.WinReason
 			mr.Winner = rr.WinnerTeam
@@ -601,7 +612,7 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 		}
 	}
 
-	// ── Try to load pre-existing parse_result.json (written by Lovable process-match) ──
+	// ── Try to load pre-existing parse_result.json ──
 	var parsed *ParseResult
 	parseResultKey := prefix + "/parse_result.json"
 	if objectExists(ctx, client, voiceBucket, parseResultKey) {
