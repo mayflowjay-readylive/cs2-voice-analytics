@@ -151,12 +151,20 @@ Your JSON must match this schema exactly:
   "toxic_utterances": [{"player": "<Player_N>", "text": "...", "reason": "..."}],
   "miscommunications": [{"player": "<Player_N>", "said": "...", "but_did": "...", "context": "..."}],
   "motivating_moments": [{"player": "<Player_N>", "text": "..."}],
+  "notable_callouts": [{"player": "<Player_N>", "text": "...", "quality": "...", "t": <seconds>}],
   "info_quality_scores": {"<Player_N>": <0.0-10.0>},
   "summary": "<2-3 sentence round communication summary>"
 }
 
 For miscommunications: compare what a player said they would do vs what the demo shows they did.
 For IGL: look for imperative language, strategy calls, role assignments.
+
+CRITICAL — notable_callouts guidelines:
+- For EVERY player who spoke this round, include at least their 1-2 best callouts in notable_callouts.
+- Include the exact quoted text from their utterance and the timestamp.
+- "quality" should be a short description: "enemy position callout", "rotation call", "utility request", "strategy call", "economy info", "clutch callout", "trade call", "site info", etc.
+- This is essential — if a player gets a high info_quality_score, the UI must be able to show WHY by displaying their actual callouts.
+- Even average callouts should be included. Only omit a player if they literally said nothing useful (pure filler/noise).
 
 CRITICAL — Toxicity detection guidelines (be VERY conservative):
 - Danish gaming culture is naturally blunt, sarcastic, and uses dark humor. This is NORMAL, not toxic.
@@ -229,6 +237,7 @@ def analyse_round(round_: dict, player_names: dict) -> dict:
             "toxic_utterances": [],
             "miscommunications": [],
             "motivating_moments": [],
+            "notable_callouts": [],
             "info_quality_scores": {},
             "summary": "No voice communications this round.",
         }
