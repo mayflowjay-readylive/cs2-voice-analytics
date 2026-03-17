@@ -16,17 +16,38 @@ const OPUS_FRAME_DURATION_MS = 20;
 const SILENCE_FRAME = Buffer.from([0xf8, 0xff, 0xfe]);
 
 export class SessionRecorder {
-  constructor({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds }) {
+  constructor({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds, steamToDiscord }) {
     this.matchId = matchId;
     this.connection = connection;
     this.voiceChannel = voiceChannel;
     this.playerMap = playerMap;
     this.excludedDiscordIds = excludedDiscordIds || new Set();
+    this.steamToDiscord = steamToDiscord || new Map();
     this.tmpDir = join(os.tmpdir(), `cs2-match-${matchId}`);
     mkdirSync(this.tmpDir, { recursive: true });
     this.receivers = new Map();
     this.audioFiles = [];
     this.recordingStartTime = null;
+  }
+
+  // Look up Steam ID for a Discord user ID.
+  // First checks the pre-built playerMap, then does a live lookup
+  // from steamToDiscord (handles late joiners).
+  _resolveSteamId(userId) {
+    // Check playerMap first (built at match start)
+    if (this.playerMap[userId]) {
+      return this.playerMap[userId];
+    }
+    // Live lookup from steamToDiscord (steamId → discordId)
+    for (const [steamId, discordId] of this.steamToDiscord) {
+      if (discordId === userId) {
+        // Cache it in playerMap for future lookups
+        this.playerMap[userId] = steamId;
+        console.log(`🔗 Late-resolved Steam ID for ${userId}: ${steamId}`);
+        return steamId;
+      }
+    }
+    return `discord_${userId}`;
   }
 
   start() {
@@ -52,7 +73,6 @@ export class SessionRecorder {
       this.recordingStartTime = Date.now();
 
       receiver.speaking.on("start", (userId) => {
-        // Check exclusion list
         if (this.excludedDiscordIds.has(userId)) {
           return;
         }
@@ -78,7 +98,6 @@ export class SessionRecorder {
       });
 
       receiver.speaking.on("end", (userId) => {
-        // Check exclusion list
         if (this.excludedDiscordIds.has(userId)) {
           return;
         }
@@ -100,7 +119,8 @@ export class SessionRecorder {
   }
 
   _startUserRecording(userId, receiver, existingFilePath, existingSteamId, existingLastPacketTime) {
-    const steamId = existingSteamId || this.playerMap[userId] || `discord_${userId}`;
+    // Use live Steam ID lookup instead of only playerMap
+    const steamId = existingSteamId || this._resolveSteamId(userId);
     const filePath = existingFilePath || join(this.tmpDir, `audio_${steamId}.opus`);
     const isReconnect = !!existingFilePath;
 
