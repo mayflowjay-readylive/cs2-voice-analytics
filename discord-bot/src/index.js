@@ -130,7 +130,8 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     }
   }
 
-  const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds });
+  // Pass steamToDiscord to recorder for live Steam ID resolution of late joiners
+  const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds, steamToDiscord });
   recorder.start();
 
   activeSessions.set(guildId, { recorder, matchId, startedAt: startedAt ?? Date.now() });
@@ -229,7 +230,6 @@ startGsiServer({
       playerMap = buildPlayerMap(channel, "gsi");
     }
 
-    // Fetch excluded players
     const excludedDiscordIds = await getExcludedDiscordIds();
     if (excludedDiscordIds.size > 0) {
       console.log(`[GSI] Excluding ${excludedDiscordIds.size} player(s) from recording`);
