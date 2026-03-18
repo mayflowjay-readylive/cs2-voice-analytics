@@ -12,6 +12,11 @@ const PHASE_WARMUP   = "warmup";
 const PHASE_LIVE     = "live";
 const PHASE_GAMEOVER = "gameover";
 
+// Cooldown after gameover to prevent demo playback from triggering recordings.
+// When watching a demo in CS2, GSI fires warmup → live just like a real match.
+// This cooldown ignores those events for 90 seconds after a match ends.
+const POST_GAMEOVER_COOLDOWN_MS = 90_000;
+
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "auto",
   endpoint: process.env.S3_ENDPOINT,
@@ -51,6 +56,7 @@ async function renameSession(oldMatchId, newMatchId) {
 
 export function startGsiServer({ onWarmup, onMatchStart, onMatchEnd }) {
   const lastPhase = new Map();
+  const gameoverTimestamps = new Map(); // steamId → timestamp of last gameover
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost`);
@@ -136,7 +142,7 @@ export function startGsiServer({ onWarmup, onMatchStart, onMatchEnd }) {
         res.end("OK");
         try {
           const state = JSON.parse(body);
-          handleGsiEvent(state, lastPhase, onWarmup, onMatchStart, onMatchEnd);
+          handleGsiEvent(state, lastPhase, gameoverTimestamps, onWarmup, onMatchStart, onMatchEnd);
         } catch (err) {
           console.error("[GSI] Failed to parse payload:", err.message);
         }
@@ -155,7 +161,7 @@ export function startGsiServer({ onWarmup, onMatchStart, onMatchEnd }) {
   return server;
 }
 
-function handleGsiEvent(state, lastPhase, onWarmup, onMatchStart, onMatchEnd) {
+function handleGsiEvent(state, lastPhase, gameoverTimestamps, onWarmup, onMatchStart, onMatchEnd) {
   const steamId  = state.provider?.steamid;
   const mapPhase = state.map?.phase;
   const matchId  = state.map?.matchid || generateMatchId(state);
@@ -165,19 +171,33 @@ function handleGsiEvent(state, lastPhase, onWarmup, onMatchStart, onMatchEnd) {
   lastPhase.set(steamId, mapPhase);
   console.log(`[GSI] steamId=${steamId} phase: ${prev ?? "unknown"} → ${mapPhase}`);
 
-  // Warmup phase — pre-connect to voice channel so DAVE handshake completes before round 1
+  // Check if we're in a post-gameover cooldown (demo playback filter)
+  const lastGameover = gameoverTimestamps.get(steamId);
+  const now = Date.now();
+  const inCooldown = lastGameover && (now - lastGameover) < POST_GAMEOVER_COOLDOWN_MS;
+
+  // Warmup phase — pre-connect to voice channel
   if (mapPhase === PHASE_WARMUP && prev !== PHASE_WARMUP) {
+    if (inCooldown) {
+      console.log(`[GSI] Warmup: Ignoring — within ${POST_GAMEOVER_COOLDOWN_MS / 1000}s cooldown after gameover (likely demo playback)`);
+      return;
+    }
     onWarmup({ matchId, steamId, source: "gsi" });
   }
 
-  // Live phase — start recording (connection should already be established from warmup)
+  // Live phase — start recording
   if (mapPhase === PHASE_LIVE && prev !== PHASE_LIVE) {
+    if (inCooldown) {
+      console.log(`[GSI] Live: Ignoring — within ${POST_GAMEOVER_COOLDOWN_MS / 1000}s cooldown after gameover (likely demo playback)`);
+      return;
+    }
     const startedAt = Date.now();
     onMatchStart({ matchId, steamId, startedAt, source: "gsi" });
   }
 
-  // Game over — stop recording and upload
+  // Game over — stop recording and set cooldown
   if (mapPhase === PHASE_GAMEOVER && (prev === PHASE_LIVE || prev === PHASE_WARMUP)) {
+    gameoverTimestamps.set(steamId, Date.now());
     onMatchEnd({ matchId, steamId, source: "gsi" });
   }
 }
