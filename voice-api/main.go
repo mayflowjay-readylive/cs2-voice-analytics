@@ -239,6 +239,23 @@ func handleBotEnabled(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"enabled": true})
 			return
 		}
+
+		// Auto-re-enable after 4 hours to prevent accidental lockout
+		enabled, _ := data["enabled"].(bool)
+		if !enabled {
+			if updatedStr, ok := data["updatedAt"].(string); ok {
+				if updatedAt, err := time.Parse(time.RFC3339, updatedStr); err == nil {
+					if time.Since(updatedAt) > 4*time.Hour {
+						log.Printf("🤖 Bot was disabled for >4 hours — auto-re-enabling")
+						data["enabled"] = true
+						data["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
+						data["autoReenabled"] = true
+						putR2Json(ctx, configKey, data)
+					}
+				}
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(data)
@@ -294,7 +311,6 @@ func handleExcludedPlayers(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		data, err := getR2Json(ctx, configKey)
 		if err != nil {
-			// No exclusions yet
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(200)
 			json.NewEncoder(w).Encode(map[string]interface{}{"players": []interface{}{}})
@@ -306,7 +322,6 @@ func handleExcludedPlayers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// POST — expects { "players": [{ "discordId": "...", "steamId": "...", "name": "..." }, ...] }
 	if r.Method == "POST" {
 		var req map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -336,7 +351,7 @@ func handleExcludedPlayers(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, `{"error":"method not allowed"}`, 405)
 }
 
-// ─── /sessions/link handler ───────────────────────────────────────────────────
+// ─── /sessions/link handler (smart matching by player overlap + time) ─────────
 
 func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
@@ -349,8 +364,9 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		MatchDate   string `json:"matchDate"`
-		DemoMatchId string `json:"demoMatchId"`
+		MatchDate   string   `json:"matchDate"`
+		DemoMatchId string   `json:"demoMatchId"`
+		PlayerIds   []string `json:"playerIds"` // Optional: Steam IDs from the demo for smart matching
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -374,15 +390,48 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			targetTs, err = time.Parse("2006-01-02T15:04:05.000Z", req.MatchDate)
 			if err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(400)
-				json.NewEncoder(w).Encode(map[string]string{"error": "invalid matchDate format"})
-				return
+				targetTs, err = time.Parse("2006-01-02 15:04:05+00", req.MatchDate)
+				if err != nil {
+					targetTs, err = time.Parse("2006-01-02 15:04:05.000+00", req.MatchDate)
+					if err != nil {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(400)
+						json.NewEncoder(w).Encode(map[string]string{"error": "invalid matchDate format"})
+						return
+					}
+				}
 			}
 		}
 	}
 	targetMs := targetTs.UnixMilli()
 
+	// Build a set of demo player Steam IDs for smart matching
+	demoPlayers := make(map[string]bool)
+	for _, pid := range req.PlayerIds {
+		if pid != "" && !strings.HasPrefix(pid, "discord_") {
+			demoPlayers[pid] = true
+		}
+	}
+
+	// If no playerIds were sent, try to load them from parse_result.json
+	if len(demoPlayers) == 0 {
+		parseKey := "matches/" + req.DemoMatchId + "/parse_result.json"
+		if prData, err := getR2Json(ctx, parseKey); err == nil {
+			if players, ok := prData["players"].([]interface{}); ok {
+				for _, p := range players {
+					if pm, ok := p.(map[string]interface{}); ok {
+						if sid, ok := pm["steamId"].(string); ok && sid != "" {
+							demoPlayers[sid] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("[link] Matching for %s (time: %s, demo players: %d)", req.DemoMatchId, targetTs.Format(time.RFC3339), len(demoPlayers))
+
+	// List all voice sessions
 	prefixes, err := listR2Prefixes(ctx, "matches/", "/")
 	if err != nil {
 		log.Printf("[link] List error: %v", err)
@@ -393,9 +442,12 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type sessionInfo struct {
-		matchId   string
-		startedAt int64
-		diff      int64
+		matchId      string
+		startedAt    int64
+		timeDiff     int64
+		playerIds    []string
+		playerOverlap int
+		score        float64
 	}
 
 	var candidates []sessionInfo
@@ -421,9 +473,46 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		if diff < 0 {
 			diff = -diff
 		}
-		if diff < threeHoursMs {
-			candidates = append(candidates, sessionInfo{matchId: matchId, startedAt: startedAt, diff: diff})
+		if diff >= threeHoursMs {
+			continue
 		}
+
+		// Extract player Steam IDs from voice session
+		var voicePlayers []string
+		if players, ok := meta["players"].([]interface{}); ok {
+			for _, p := range players {
+				if pm, ok := p.(map[string]interface{}); ok {
+					if sid, ok := pm["steamId"].(string); ok && sid != "" && !strings.HasPrefix(sid, "discord_") {
+						voicePlayers = append(voicePlayers, sid)
+					}
+				}
+			}
+		}
+
+		// Count player overlap
+		overlap := 0
+		if len(demoPlayers) > 0 {
+			for _, vid := range voicePlayers {
+				if demoPlayers[vid] {
+					overlap++
+				}
+			}
+		}
+
+		// Score: prioritize player overlap, then time proximity
+		// Score formula: overlap * 1000 - timeDiffSeconds
+		// This means any session with even 1 player overlap beats a closer session with 0 overlap
+		timeDiffSec := float64(diff) / 1000.0
+		score := float64(overlap)*1000.0 - timeDiffSec
+
+		candidates = append(candidates, sessionInfo{
+			matchId:       matchId,
+			startedAt:     startedAt,
+			timeDiff:      diff,
+			playerIds:     voicePlayers,
+			playerOverlap: overlap,
+			score:         score,
+		})
 	}
 
 	if len(candidates) == 0 {
@@ -433,14 +522,19 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	closest := candidates[0]
+	// Sort by score descending (highest overlap + closest time wins)
+	best := candidates[0]
 	for _, c := range candidates[1:] {
-		if c.diff < closest.diff {
-			closest = c
+		if c.score > best.score {
+			best = c
 		}
 	}
 
-	oldPrefix := "matches/" + closest.matchId + "/"
+	log.Printf("[link] Best match: %s (overlap: %d/%d players, timeDiff: %ds, score: %.1f)",
+		best.matchId, best.playerOverlap, len(demoPlayers), best.timeDiff/1000, best.score)
+
+	// Rename session
+	oldPrefix := "matches/" + best.matchId + "/"
 	newPrefix := "matches/" + req.DemoMatchId + "/"
 
 	keys, err := listR2Keys(ctx, oldPrefix)
@@ -475,15 +569,17 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		putR2Json(ctx, newPrefix+"meta.json", newMeta)
 	}
 
-	log.Printf("✅ Linked session %s → %s (diff: %ds)", closest.matchId, req.DemoMatchId, closest.diff/1000)
+	log.Printf("✅ Linked session %s → %s (overlap: %d, diff: %ds)",
+		best.matchId, req.DemoMatchId, best.playerOverlap, best.timeDiff/1000)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"linked":          true,
-		"oldMatchId":      closest.matchId,
+		"oldMatchId":      best.matchId,
 		"newMatchId":      req.DemoMatchId,
-		"timeDiffSeconds": int(math.Round(float64(closest.diff) / 1000)),
+		"timeDiffSeconds": int(math.Round(float64(best.timeDiff) / 1000)),
+		"playerOverlap":   best.playerOverlap,
 	})
 }
 
