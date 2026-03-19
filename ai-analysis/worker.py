@@ -223,31 +223,60 @@ def render_round_for_prompt(round_: dict, player_names: dict) -> str:
 
 
 ROUND_ANALYSIS_SYSTEM = """You are an expert CS2 analyst specializing in team communication analysis.
-You will receive a CS2 round timeline combining voice communications (🎙️) with in-game events.
+You will receive a CS2 round timeline combining voice communications (🎙️) with in-game events (kills 💀, bomb plants 💣, defuses 🔧, explosions 💥).
 Players are identified by aliases like Player_1, Player_2, etc.
 Voice comms may be in Danish mixed with English CS2 terms — analyse based on meaning, not language.
+
+Your job is to analyse how communication CONNECTED to in-game outcomes. Every insight must link what was said to what happened.
+
 Analyze the communication quality and return ONLY valid JSON with no preamble or markdown.
 
 Your JSON must match this schema exactly:
 {
+  "round_outcome": "<won|lost>",
+  "comms_impact_on_outcome": "<positive|negative|neutral>",
   "igl_candidate": "<Player_N alias or null>",
   "toxic_utterances": [{"player": "<Player_N>", "text": "...", "reason": "..."}],
-  "miscommunications": [{"player": "<Player_N>", "said": "...", "but_did": "...", "context": "..."}],
-  "motivating_moments": [{"player": "<Player_N>", "text": "..."}],
-  "notable_callouts": [{"player": "<Player_N>", "text": "...", "quality": "...", "t": <seconds>}],
-  "info_quality_scores": {"<Player_N>": <0.0-10.0>},
-  "summary": "<2-3 sentence round communication summary>"
+  "miscommunications": [{"player": "<Player_N>", "said": "...", "but_did": "...", "context": "...", "cost": "<what it cost the team — e.g. 'lost the round', 'gave up site control', 'player died', 'no impact'>"}],
+  "motivating_moments": [{"player": "<Player_N>", "text": "...", "context": "<what triggered it — e.g. 'after teammate got a 3k', 'after losing pistol round', 'during eco round'>", "effect": "<how team responded — e.g. 'team rallied and won the force buy', 'no visible impact', 'improved coordination next round'>"}],
+  "key_callouts": [
+    {
+      "player": "<Player_N>",
+      "text": "...",
+      "t": <seconds>,
+      "type": "<info|strategy|utility_request|rotation|trade_call|clutch_call|economy>",
+      "outcome": "<what happened as a direct result within 5-10 seconds — e.g. 'teammate got the kill 3s later', 'team rotated and retook site', 'call was ignored, site fell', 'led to successful B execute'>",
+      "impact": "<high|medium|low>",
+      "round_impact": "<won_round|lost_round|got_kill|got_trade|successful_retake|successful_execute|plant|defuse|no_direct_impact>"
+    }
+  ],
+  "info_quality_scores": {
+    "<Player_N>": {"score": <0.0-10.0>, "reason": "<1 sentence explaining why — e.g. 'Called 3 accurate positions that led to 2 kills' or 'Only spoke once with vague info'>"}
+  },
+  "silent_players": ["<Player_N aliases who had voice data but said nothing useful this round>"],
+  "summary": "<2-3 sentence summary that specifically connects communication to the round outcome. Don't just describe what happened — explain HOW comms helped win or contributed to losing.>"
 }
 
-For miscommunications: compare what a player said they would do vs what the demo shows they did.
-For IGL: look for imperative language, strategy calls, role assignments.
+CRITICAL — key_callouts guidelines:
+- Only include callouts that had a VISIBLE connection to an in-game event.
+- Look at the timeline: if someone calls a position and a kill happens at that location within 5-10 seconds, that's a key callout.
+- If someone calls a rotation and the team successfully retakes, that's a key callout.
+- If someone requests utility and it leads to a successful execute, that's a key callout.
+- Do NOT include generic filler or callouts with no outcome. "Nice" or "okay" alone is NOT a key callout.
+- Maximum 3-4 key callouts per round — only the ones that actually mattered.
+- An empty key_callouts array is fine if no callout had a measurable impact.
 
-CRITICAL — notable_callouts guidelines:
-- For EVERY player who spoke this round, include at least their 1-2 best callouts in notable_callouts.
-- Include the exact quoted text from their utterance and the timestamp.
-- "quality" should be a short description: "enemy position callout", "rotation call", "utility request", "strategy call", "economy info", "clutch callout", "trade call", "site info", etc.
-- This is essential — if a player gets a high info_quality_score, the UI must be able to show WHY by displaying their actual callouts.
-- Even average callouts should be included. Only omit a player if they literally said nothing useful (pure filler/noise).
+CRITICAL — miscommunications guidelines:
+- Always include what the miscommunication COST the team. Did they lose the round? Did a player die? Did they lose map control?
+- Compare what was said to what the demo events show actually happened.
+- If a player called "all B" but kills happened at A, that's a miscommunication.
+
+CRITICAL — motivating_moments guidelines:
+- Include what TRIGGERED the moment (a good play, a bad loss, an eco round).
+- Include the EFFECT — did the team play better after? Did coordination improve?
+- Genuine hype after clutches, multi-kills, or comebacks.
+- Encouragement after lost rounds that helped morale.
+- Empty array is fine if nobody was particularly motivating.
 
 CRITICAL — Toxicity detection guidelines (be VERY conservative):
 - Danish gaming culture is naturally blunt, sarcastic, and uses dark humor. This is NORMAL, not toxic.
@@ -259,14 +288,15 @@ CRITICAL — Toxicity detection guidelines (be VERY conservative):
 - When in doubt, it is NOT toxic. False positives are worse than false negatives here.
 - An empty toxic_utterances array is the expected outcome for most rounds.
 
-For info quality: rate how useful each player's callouts were (positions, counts, utility status).
-
-For motivating_moments: include genuine encouragement, hype after good plays, compliments (even sarcastic ones that are clearly positive in intent), and expressions of shared team emotion (both positive and empathetic disappointment).
+For summary: Don't just say "good communication this round." Say HOW the comms connected to the result — "Player_1's B rotation call gave Player_3 time to rotate, leading to a 2v1 retake win" or "Despite good callouts, the team couldn't capitalize because Player_2 and Player_4 peeked the same angle after being told to split."
 """
 
 MATCH_SUMMARY_SYSTEM = """You are an expert CS2 communication analyst.
 Given per-round analysis data (using Player_N aliases) and a player alias->steamId map,
 produce a final match-level player assessment keyed by steamId.
+
+Your job is to connect communication patterns to match outcomes. Every score and insight must be backed by specific evidence from the rounds.
+
 Return ONLY valid JSON with no preamble or markdown.
 
 Schema:
@@ -281,15 +311,59 @@ Schema:
       "info_density": <0-100>,
       "callout_accuracy": <0-100>,
       "dominant_role": "<entry|support|lurk|igl|awper|unknown>",
-      "notable_moments": ["..."],
-      "improvement_tips": ["..."]
+      "notable_moments": [
+        "<Specific moment with round number and outcome — e.g. 'Round 8: Called 2 players tunnels, teammate got double kill 3s later (round won)' or 'Round 15: Mid-round IGL call to rotate A, team got the retake'>",
+        "<Another specific moment>"
+      ],
+      "improvement_tips": [
+        "<Specific advice referencing actual rounds — e.g. 'In rounds 5 and 11, called positions but too late (after teammate already died). Try to call earlier when you first spot movement.' or 'Went silent in rounds 8-12 during CT side — more info calls when holding site would help teammates rotate faster.'>",
+        "<Another specific tip>"
+      ],
+      "key_callout": {
+        "text": "<their single best callout from the entire match>",
+        "round": <round number>,
+        "outcome": "<what happened as a result>"
+      }
     }
   ],
   "team_chemistry_score": <0-100>,
-  "communication_flow": "<description>",
-  "key_miscommunications": [{"round": <n>, "steam_id": "...", "description": "..."}],
-  "match_summary": "<3-5 sentence overall communication summary>"
+  "communication_flow": "<Describe how comms evolved through the match — e.g. 'Strong early coordination on T-side with clean executes, but communication broke down after going 5-8 deficit. Recovered in second half when Player_2 started making mid-round calls.'>",
+  "key_miscommunications": [
+    {
+      "round": <n>,
+      "steam_id": "...",
+      "description": "<what was said vs what happened>",
+      "cost": "<what it cost — e.g. 'Lost the round, led to 3-round losing streak' or 'Gave up A site control but recovered'>"
+    }
+  ],
+  "turning_points": [
+    {
+      "round": <n>,
+      "description": "<A round where communication clearly changed the match direction — e.g. 'Round 12: Player_1 called a full B stack read, team rotated early and got a clean 5v3 retake. Won 4 of the next 5 rounds after this.'>"
+    }
+  ],
+  "match_summary": "<3-5 sentence overall communication summary that explains how comms contributed to the final result. Reference specific rounds and patterns, not generic observations.>"
 }
+
+CRITICAL — notable_moments guidelines:
+- Every moment MUST reference a specific round number and a specific outcome.
+- "Good A-site calls" is too vague. "Round 8: Called AWP peek A long → teammate pre-aimed and got the opening pick (round won)" is good.
+- Maximum 2-3 moments per player — only the ones that genuinely mattered.
+
+CRITICAL — improvement_tips guidelines:
+- Every tip MUST reference specific rounds or patterns from THIS match.
+- "Communicate more" is useless. "Went silent in rounds 8-12 when holding B site — calling enemy utility usage would have helped Player_3 time rotations better" is useful.
+- Maximum 2 tips per player. Be specific and actionable.
+
+CRITICAL — key_callout guidelines:
+- Pick each player's single most impactful callout from the entire match.
+- Must include what happened as a result.
+- If a player never made an impactful callout, use their best attempt with honest outcome.
+
+CRITICAL — turning_points guidelines:
+- Identify 1-3 rounds where communication clearly shifted the match momentum.
+- These should be moments where a specific callout or communication pattern led to a streak change.
+- Can be positive (comms won a crucial round) or negative (miscommunication triggered a losing streak).
 """
 
 
@@ -316,12 +390,15 @@ def analyse_round(round_: dict, player_names: dict) -> dict:
     has_comms = any(ev.get("type") == "utterance" for ev in events)
     if not has_comms:
         return {
+            "round_outcome": None,
+            "comms_impact_on_outcome": "neutral",
             "igl_candidate": None,
             "toxic_utterances": [],
             "miscommunications": [],
             "motivating_moments": [],
-            "notable_callouts": [],
+            "key_callouts": [],
             "info_quality_scores": {},
+            "silent_players": [],
             "summary": "No voice communications this round.",
         }
 
