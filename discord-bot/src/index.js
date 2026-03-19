@@ -22,6 +22,25 @@ const activeSessions = new Map();
 const pendingConnections = new Map();
 const steamToDiscord = new Map();
 
+// ─── Guild-level cooldown ────────────────────────────────────────────────────
+// After a recording stops, block new GSI-triggered recordings for this guild.
+// This prevents ghost recordings when a second GSI player fires
+// gameover → warmup → live immediately after a match ends.
+
+const guildCooldowns = new Map(); // guildId → timestamp of last recording stop
+const GUILD_COOLDOWN_MS = 120_000; // 2 minutes
+
+function isGuildInCooldown(guildId) {
+  const lastStop = guildCooldowns.get(guildId);
+  if (!lastStop) return false;
+  const elapsed = Date.now() - lastStop;
+  if (elapsed < GUILD_COOLDOWN_MS) {
+    return elapsed;
+  }
+  guildCooldowns.delete(guildId);
+  return false;
+}
+
 // ─── Persist Steam→Discord links ─────────────────────────────────────────────
 
 const LINKS_FILE = "/app/data/steam_links.json";
@@ -144,6 +163,11 @@ async function stopRecording(guildId) {
   const { recorder, matchId } = session;
   const audioFiles = await recorder.stop();
   activeSessions.delete(guildId);
+
+  // Set guild cooldown BEFORE upload to block any ghost recordings immediately
+  guildCooldowns.set(guildId, Date.now());
+  console.log(`🛡️ Guild cooldown set for ${GUILD_COOLDOWN_MS / 1000}s`);
+
   await uploadSession({ matchId, audioFiles, startedAt: session.startedAt });
   console.log(`✅ Upload complete: match=${matchId}, tracks=${audioFiles.length}`);
   return { matchId, audioFiles };
@@ -186,6 +210,13 @@ startGsiServer({
     const { guild, channel } = location;
     const guildId = guild.id;
 
+    // Guild-level cooldown — blocks ghost warmups after match end
+    const cooldownElapsed = isGuildInCooldown(guildId);
+    if (cooldownElapsed !== false) {
+      console.log(`[GSI] Warmup: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
+      return;
+    }
+
     if (activeSessions.has(guildId)) { console.log(`[GSI] Warmup: Already recording — ignoring`); return; }
     if (pendingConnections.has(guildId)) { console.log(`[GSI] Warmup: Already pre-connected — ignoring`); return; }
 
@@ -207,6 +238,21 @@ startGsiServer({
     if (!location) { console.log(`[GSI] ${steamId} not in any voice channel — skipping`); return; }
     const { guild, channel } = location;
     const guildId = guild.id;
+
+    // Guild-level cooldown — blocks ghost recordings after match end
+    const cooldownElapsed = isGuildInCooldown(guildId);
+    if (cooldownElapsed !== false) {
+      console.log(`[GSI] Live: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
+      // Clean up any pending connection from a ghost warmup that slipped through
+      if (pendingConnections.has(guildId)) {
+        const pending = pendingConnections.get(guildId);
+        pendingConnections.delete(guildId);
+        try { pending.connection.destroy(); } catch {}
+        console.log(`[GSI] Live: Cleaned up ghost pre-connection`);
+      }
+      return;
+    }
+
     if (activeSessions.has(guildId)) { console.log(`[GSI] Already recording — ignoring`); return; }
 
     const pending = pendingConnections.get(guildId);
@@ -252,12 +298,21 @@ startGsiServer({
       const pending = pendingConnections.get(guildId);
       pendingConnections.delete(guildId);
       try { pending.connection.destroy(); } catch {}
-      console.log(`[GSI] Cleaned up pre-connection (match ended without going live)`);
+      // Also set cooldown when cleaning up a pre-connection
+      guildCooldowns.set(guildId, Date.now());
+      console.log(`[GSI] Cleaned up pre-connection (match ended without going live) — cooldown set`);
       return;
     }
 
     if (!activeSessions.has(guildId)) return;
-    try { await stopRecording(guildId); } catch (err) { console.error(`[GSI] Failed to auto-stop:`, err.message); }
+    try {
+      await stopRecording(guildId);
+      // stopRecording already sets guildCooldowns
+    } catch (err) {
+      console.error(`[GSI] Failed to auto-stop:`, err.message);
+      // Set cooldown even on error to prevent ghost recordings
+      guildCooldowns.set(guildId, Date.now());
+    }
   },
 });
 
@@ -337,6 +392,9 @@ client.on("interactionCreate", async (interaction) => {
           try { pending.connection.destroy(); } catch {}
         }
 
+        // Manual /match start clears any guild cooldown
+        guildCooldowns.delete(guildId);
+
         const matchId = options.getString("matchid") || `manual-${Date.now()}`;
         const playerMap = buildPlayerMap(voiceChannel, "manual");
         const playerMapRaw = options.getString("playermap") || "";
@@ -363,6 +421,7 @@ client.on("interactionCreate", async (interaction) => {
       else if (sub === "end") {
         if (!activeSessions.has(guildId)) return interaction.editReply("❌ No active recording.");
         const result = await stopRecording(guildId);
+        // stopRecording already sets guildCooldowns
         return interaction.editReply(
           `✅ Session uploaded for match \`${result.matchId}\`\n` +
           `${result.audioFiles.length} player tracks uploaded. Transcription will begin shortly.`
@@ -388,7 +447,13 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.editReply("⏳ Bot is pre-connected and waiting for match to go live (warmup phase).");
         }
         const session = activeSessions.get(guildId);
-        if (!session) return interaction.editReply("📭 No active recording.");
+        if (!session) {
+          const cooldownElapsed = isGuildInCooldown(guildId);
+          if (cooldownElapsed !== false) {
+            return interaction.editReply(`📭 No active recording. Guild cooldown active for ${Math.round((GUILD_COOLDOWN_MS - cooldownElapsed) / 1000)}s (prevents ghost recordings after match end).`);
+          }
+          return interaction.editReply("📭 No active recording.");
+        }
         const elapsed = Math.floor((Date.now() - session.startedAt) / 1000);
         return interaction.editReply(`🎙️ Recording active for match \`${session.matchId}\`\nElapsed: **${Math.floor(elapsed/60)}m ${elapsed%60}s**`);
       }
