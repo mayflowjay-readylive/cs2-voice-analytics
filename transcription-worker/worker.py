@@ -161,24 +161,38 @@ Return ONLY a JSON array with this exact schema, no preamble or markdown:
 If there is silence or no speech, return an empty array: []
 """
 
-CLEANUP_PROMPT = """You are a CS2 communication transcript editor.
+CLEANUP_PROMPT = """You are a transcript editor for CS2 voice recordings in Danish.
 The following transcript was auto-generated from a Danish CS2 voice recording.
-It may contain errors in CS2 callouts, weapon names, or tactical terms.
+It may contain transcription errors that need fixing.
 
 Known correct CS2 terms (fix any misspellings or misheard versions):
 {callout_list}
 
-Rules:
-- Fix obvious CS2 term errors (e.g. "a dæbliup" → "AWP", "molly" → "Molotov")
-- Fix Danish words that were clearly misheard CS2 terms
-- Do NOT change correct Danish words or grammar
-- Do NOT add or remove content — only fix errors
-- Return the corrected utterances in the exact same JSON format as input
+Rules — fix ALL of the following issues:
 
-Input transcript:
-{transcript_json}
+1. CS2 TERM CORRECTIONS:
+   - Fix obvious CS2 term errors (e.g. "a dæbliup" → "AWP", "molly" → "Molotov")
+   - Fix Danish words that were clearly misheard CS2 terms
 
-Return ONLY the corrected JSON array, no preamble or markdown."""
+2. DUPLICATED WORDS AND STUTTERS:
+   - Remove accidental word repetitions (e.g. "til til" → "til", "jeg jeg" → "jeg")
+   - Remove transcription stutters where the same word appears twice in a row
+   - Keep intentional repetitions for emphasis (e.g. "go go go" should stay)
+
+3. GRAMMAR AND SENTENCE CLEANUP:
+   - Fix broken Danish grammar caused by transcription errors
+   - Fix words that were clearly misheard (e.g. wrong preposition, wrong verb form)
+   - Merge sentence fragments that clearly belong together
+   - Remove filler artifacts that aren't real words
+
+4. PRESERVE:
+   - Do NOT change the meaning or intent of what was said
+   - Do NOT add content that wasn't spoken
+   - Do NOT remove intentional filler words (e.g. "øh", "altså") — these are natural speech
+   - Do NOT change correct Danish words or grammar
+   - Keep all timestamps (t_start, t_end) exactly as they are
+
+Return ONLY the corrected JSON array in the exact same format as input, no preamble or markdown."""
 
 
 def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None) -> list[Utterance]:
@@ -243,7 +257,7 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
 
 
 def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
-    """Post-processing pass to fix CS2 term errors using Gemini."""
+    """Post-processing pass to fix CS2 term errors and transcription artifacts using Gemini."""
     if not raw_utterances:
         return raw_utterances
 
