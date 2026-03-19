@@ -97,7 +97,7 @@ def check_stale_sessions():
                 pass
 
 
-# ─── Prompt builders ──────────────────────────────────────────────────────────
+# ─── Player identity resolution ──────────────────────────────────────────────
 
 def build_player_context(timeline: dict) -> dict:
     """Build a steamId → Player_N alias map from all events in the timeline."""
@@ -108,6 +108,89 @@ def build_player_context(timeline: dict) -> dict:
                 steam_ids.add(ev["steamId"])
     return {sid: f"Player_{i+1}" for i, sid in enumerate(sorted(steam_ids))}
 
+
+def load_player_info(match_id: str) -> dict:
+    """Load player identity info from parse_result.json and meta.json.
+
+    Returns a dict keyed by steamId with available info:
+    {
+        "76561197978593980": {
+            "steamId": "76561197978593980",
+            "name": "PlayerName",       # from parse_result (in-game name)
+            "discordId": "362662...",    # from meta.json
+            "team": 2                    # from parse_result
+        }
+    }
+    """
+    player_info = {}
+    prefix = f"matches/{match_id}"
+
+    # Load in-game names + teams from parse_result.json
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{prefix}/parse_result.json")
+        parse_result = json.loads(obj["Body"].read())
+        for p in parse_result.get("players", []):
+            sid = p.get("steamId", "")
+            if sid:
+                player_info[sid] = {
+                    "steamId": sid,
+                    "name": p.get("name", ""),
+                    "team": p.get("team", 0),
+                }
+        log.info(f"  Loaded {len(player_info)} player names from parse_result.json")
+    except Exception as e:
+        log.warning(f"  Could not load parse_result.json for player names: {e}")
+
+    # Enrich with discordId from meta.json
+    try:
+        meta = get_meta(match_id)
+        for p in meta.get("players", []):
+            sid = p.get("steamId", "")
+            if sid:
+                if sid not in player_info:
+                    player_info[sid] = {"steamId": sid, "name": "", "team": 0}
+                player_info[sid]["discordId"] = p.get("discordId", "")
+    except Exception as e:
+        log.warning(f"  Could not load meta.json for discord IDs: {e}")
+
+    return player_info
+
+
+def build_player_map(player_names: dict, player_info: dict) -> dict:
+    """Build a complete player map for output files.
+
+    Returns:
+    {
+        "alias_to_steam_id": {"Player_1": "76561197978593980", ...},
+        "steam_id_to_alias": {"76561197978593980": "Player_1", ...},
+        "players": {
+            "76561197978593980": {
+                "alias": "Player_1",
+                "name": "PlayerName",
+                "discordId": "362662...",
+                "team": 2
+            }
+        }
+    }
+    """
+    alias_to_steam = {alias: sid for sid, alias in player_names.items()}
+    players = {}
+    for sid, alias in player_names.items():
+        info = player_info.get(sid, {})
+        players[sid] = {
+            "alias": alias,
+            "name": info.get("name", ""),
+            "discordId": info.get("discordId", ""),
+            "team": info.get("team", 0),
+        }
+    return {
+        "alias_to_steam_id": alias_to_steam,
+        "steam_id_to_alias": dict(player_names),
+        "players": players,
+    }
+
+
+# ─── Prompt builders ──────────────────────────────────────────────────────────
 
 def render_round_for_prompt(round_: dict, player_names: dict) -> str:
     round_num = round_.get("roundNum", "?")
@@ -275,6 +358,11 @@ def process_session(match_id: str):
     player_names = build_player_context(timeline)
     log.info(f"  Players: {player_names}")
 
+    # Load player identity info (names, discordIds, teams)
+    player_info = load_player_info(match_id)
+    player_map = build_player_map(player_names, player_info)
+    log.info(f"  Player map: {json.dumps(player_map['players'], indent=2)}")
+
     rounds = timeline.get("rounds", [])
     log.info(f"  Rounds: {len(rounds)}, map: {timeline.get('mapName', 'unknown')}")
 
@@ -290,11 +378,16 @@ def process_session(match_id: str):
             log.error(f"  Round {round_.get('roundNum')} analysis failed: {e}")
         time.sleep(0.5)  # Rate limit courtesy pause
 
-    # Upload round analyses
+    # Upload round analyses — include player_map so the frontend can resolve aliases
+    round_analyses_output = {
+        "match_id": match_id,
+        "player_map": player_map,
+        "rounds": round_analyses,
+    }
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=f"{prefix}/round_analyses.json",
-        Body=json.dumps(round_analyses, indent=2),
+        Body=json.dumps(round_analyses_output, indent=2),
         ContentType="application/json",
     )
     log.info(f"  Uploaded round_analyses.json ({len(round_analyses)} rounds)")
@@ -303,6 +396,7 @@ def process_session(match_id: str):
     log.info("  Generating match-level player scores…")
     match_summary = aggregate_and_summarise(round_analyses, timeline, player_names)
     match_summary["match_id"] = match_id
+    match_summary["player_map"] = player_map
     match_summary["analysed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     s3.put_object(
