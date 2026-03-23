@@ -34,7 +34,18 @@ import (
 const (
 	staleThreshold = 15 * time.Minute
 	maxRetries     = 3
+
+	// How long to wait for parse_result.json / voice-link before giving up.
+	// The voice-link-worker on Lovable's side needs time to:
+	//   1. Detect the match in Supabase
+	//   2. Call /sessions/link to rename the voice session
+	//   3. Upload parse_result.json to R2
+	// This grace period prevents premature error_alignment.
+	waitForDataTimeout = 60 * time.Minute
 )
+
+// Sentinel error — means "not ready yet, try again later"
+var errNotReadyYet = fmt.Errorf("NOT_READY")
 
 // ─── Types: Demo parser output (matches your existing Go parser) ──────────────
 
@@ -82,15 +93,15 @@ type PlayerStats struct {
 }
 
 type ParseResult struct {
-	MapName     string        `json:"mapName"`
-	Team1Name   string        `json:"team1Name"`
-	Team2Name   string        `json:"team2Name"`
-	ScoreTeam1  int           `json:"scoreTeam1"`
-	ScoreTeam2  int           `json:"scoreTeam2"`
-	Players     []PlayerStats `json:"players"`
-	Rounds      []RoundResult `json:"rounds"`
-	KillEvents  []KillEvent   `json:"killEvents"`
-	BombEvents  []BombEvent   `json:"bombEvents"`
+	MapName    string        `json:"mapName"`
+	Team1Name  string        `json:"team1Name"`
+	Team2Name  string        `json:"team2Name"`
+	ScoreTeam1 int           `json:"scoreTeam1"`
+	ScoreTeam2 int           `json:"scoreTeam2"`
+	Players    []PlayerStats `json:"players"`
+	Rounds     []RoundResult `json:"rounds"`
+	KillEvents []KillEvent   `json:"killEvents"`
+	BombEvents []BombEvent   `json:"bombEvents"`
 }
 
 // ─── Types: Transcript ────────────────────────────────────────────────────────
@@ -587,6 +598,18 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	prefix := "matches/" + matchID
 	log.Printf("Aligning match: %s", matchID)
 
+	// Load meta first to check session age before setting aligning status
+	var rawMeta map[string]interface{}
+	if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &rawMeta); err != nil {
+		return fmt.Errorf("load meta: %w", err)
+	}
+
+	// Calculate session age from startedAt
+	sessionAge := time.Duration(0)
+	if startedAt, ok := rawMeta["startedAt"].(float64); ok {
+		sessionAge = time.Since(time.UnixMilli(int64(startedAt)))
+	}
+
 	// Set intermediate status
 	if err := setStatus(ctx, client, voiceBucket, matchID, "aligning", nil); err != nil {
 		return fmt.Errorf("set aligning status: %w", err)
@@ -598,12 +621,6 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 		return fmt.Errorf("load transcript: %w", err)
 	}
 	log.Printf("  Transcript: %d utterances, recordingStartMs=%d", len(transcript.Utterances), transcript.RecordingStartMs)
-
-	// Load meta for recordingStartMs
-	var rawMeta map[string]interface{}
-	if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &rawMeta); err != nil {
-		return fmt.Errorf("load meta: %w", err)
-	}
 
 	recordingStartMs := transcript.RecordingStartMs
 	if v, ok := rawMeta["recordingStartMs"]; ok {
@@ -632,6 +649,23 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 
 		demoKey, err := findMatchingDemo(ctx, client, demoBucket, recordingStartMs)
 		if err != nil {
+			// No parse_result.json AND no demo found.
+			// Check if the session is still young — the voice-link-worker
+			// might not have renamed the session yet.
+			if sessionAge < waitForDataTimeout {
+				waitRemaining := waitForDataTimeout - sessionAge
+				log.Printf("  ⏳ No data available yet (session is %s old). Waiting for voice-link — will retry for %s more.",
+					sessionAge.Round(time.Second), waitRemaining.Round(time.Second))
+				log.Printf("     The voice-link-worker may still rename this session and upload parse_result.json.")
+
+				// Set back to pending_alignment so we try again on next poll
+				setStatus(ctx, client, voiceBucket, matchID, "pending_alignment", nil)
+				return errNotReadyYet
+			}
+
+			// Session is old enough — give up
+			log.Printf("  ❌ Session is %s old (past %s timeout) — no data arrived. Giving up.",
+				sessionAge.Round(time.Second), waitForDataTimeout)
 			return fmt.Errorf("find demo: %w", err)
 		}
 
@@ -737,6 +771,7 @@ func main() {
 	log.Printf("   Demo bucket:  %s", demoBucket)
 	log.Printf("   Parser URL:   %s", parserURL)
 	log.Printf("   Poll interval: %s", pollInterval)
+	log.Printf("   Wait-for-data timeout: %s", waitForDataTimeout)
 
 	for {
 		checkStaleSessions(ctx, client, voiceBucket)
@@ -748,6 +783,10 @@ func main() {
 			log.Printf("Found %d pending session(s): %v", len(pending), pending)
 			for _, matchID := range pending {
 				if err := processSession(ctx, client, voiceBucket, demoBucket, parserURL, matchID); err != nil {
+					if err == errNotReadyYet {
+						// Not an error — just waiting for voice-link. Already set back to pending_alignment.
+						continue
+					}
 					log.Printf("❌ Error processing %s: %v", matchID, err)
 					setStatus(ctx, client, voiceBucket, matchID, "error_alignment", map[string]interface{}{
 						"error": err.Error(),
