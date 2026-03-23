@@ -46,6 +46,7 @@ func main() {
 	mux.HandleFunc("/analysis/", handleAnalysis)
 	mux.HandleFunc("/rounds/", handleRounds)
 	mux.HandleFunc("/status/", handleStatus)
+	mux.HandleFunc("/retry/", handleRetry)
 	mux.HandleFunc("/sessions/link", handleSessionsLink)
 	mux.HandleFunc("/bot/enabled", handleBotEnabled)
 	mux.HandleFunc("/bot/excluded-players", handleExcludedPlayers)
@@ -218,6 +219,85 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	serveR2JSON(w, r, fmt.Sprintf("matches/%s/meta.json", matchID))
 }
 
+// ─── /retry/{matchId} handler ────────────────────────────────────────────
+
+func handleRetry(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"method not allowed"}`, 405)
+		return
+	}
+
+	matchID := extractMatchID(r.URL.Path, "/retry/")
+	if matchID == "" {
+		http.Error(w, `{"error":"matchId required"}`, 400)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	key := fmt.Sprintf("matches/%s/meta.json", matchID)
+	data, err := getR2Json(ctx, key)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "match not found in voice pipeline"})
+		return
+	}
+
+	currentStatus, _ := data["status"].(string)
+	var newStatus string
+
+	switch {
+	case strings.HasPrefix(currentStatus, "error_transcription"):
+		newStatus = "pending_transcription"
+	case strings.HasPrefix(currentStatus, "error_alignment"):
+		newStatus = "pending_alignment"
+	case strings.HasPrefix(currentStatus, "error_analysis"):
+		newStatus = "pending_analysis"
+	case currentStatus == "complete":
+		newStatus = "pending_analysis"
+	case currentStatus == "pending_transcription", currentStatus == "pending_alignment", currentStatus == "pending_analysis":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"matchId": matchID,
+			"status":  currentStatus,
+			"message": "Already pending — pipeline will pick it up shortly",
+		})
+		return
+	default:
+		newStatus = "pending_alignment"
+	}
+
+	data["status"] = newStatus
+	data["statusUpdatedAt"] = time.Now().UTC().Format(time.RFC3339)
+	delete(data, "error")
+	data["retryCount"] = 0
+
+	if err := putR2Json(ctx, key, data); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	log.Printf("🔄 Retry triggered for %s: %s → %s", matchID, currentStatus, newStatus)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"matchId":        matchID,
+		"previousStatus": currentStatus,
+		"newStatus":      newStatus,
+		"message":        "Pipeline will retry within 30 seconds",
+	})
+}
+
 // ─── /bot/enabled handler ─────────────────────────────────────────────────
 
 func handleBotEnabled(w http.ResponseWriter, r *http.Request) {
@@ -366,7 +446,7 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		MatchDate   string   `json:"matchDate"`
 		DemoMatchId string   `json:"demoMatchId"`
-		PlayerIds   []string `json:"playerIds"` // Optional: Steam IDs from the demo for smart matching
+		PlayerIds   []string `json:"playerIds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -442,12 +522,12 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type sessionInfo struct {
-		matchId      string
-		startedAt    int64
-		timeDiff     int64
-		playerIds    []string
+		matchId       string
+		startedAt     int64
+		timeDiff      int64
+		playerIds     []string
 		playerOverlap int
-		score        float64
+		score         float64
 	}
 
 	var candidates []sessionInfo
@@ -500,8 +580,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Score: prioritize player overlap, then time proximity
-		// Score formula: overlap * 1000 - timeDiffSeconds
-		// This means any session with even 1 player overlap beats a closer session with 0 overlap
 		timeDiffSec := float64(diff) / 1000.0
 		score := float64(overlap)*1000.0 - timeDiffSec
 
