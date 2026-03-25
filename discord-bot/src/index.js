@@ -22,6 +22,32 @@ const activeSessions = new Map();
 const pendingConnections = new Map();
 const steamToDiscord = new Map();
 
+// ─── GSI event queue ─────────────────────────────────────────────────────────
+// GSI events can arrive before the Discord client is logged in (e.g. after pm2 restart).
+// Instead of dropping them, we queue and replay once the client is ready.
+
+const pendingGsiEvents = [];
+let clientReady = false;
+
+function queueOrRun(handler, event) {
+  if (clientReady) {
+    handler(event);
+  } else {
+    pendingGsiEvents.push({ handler, event });
+    console.log(`[GSI] Client not ready — queued ${event.type} event for ${event.steamId} (${pendingGsiEvents.length} in queue)`);
+  }
+}
+
+function replayQueuedEvents() {
+  if (pendingGsiEvents.length === 0) return;
+  console.log(`[GSI] Replaying ${pendingGsiEvents.length} queued event(s)...`);
+  const events = [...pendingGsiEvents];
+  pendingGsiEvents.length = 0;
+  for (const { handler, event } of events) {
+    handler(event);
+  }
+}
+
 // ─── Guild-level cooldown ────────────────────────────────────────────────────
 // After a recording stops, block new GSI-triggered recordings for this guild.
 // This prevents ghost recordings when a second GSI player fires
@@ -199,121 +225,124 @@ function findVoiceChannelForSteam(steamId) {
   return null;
 }
 
-// ─── GSI ──────────────────────────────────────────────────────────────────────
+// ─── GSI handlers ────────────────────────────────────────────────────────────
 
-startGsiServer({
-  onWarmup: async ({ matchId, steamId }) => {
-    if (!client.isReady()) return;
-    if (!(await isBotEnabled())) { console.log(`[GSI] Warmup: Bot disabled — skipping`); return; }
-    const location = findVoiceChannelForSteam(steamId);
-    if (!location) { console.log(`[GSI] Warmup: ${steamId} not in any voice channel — skipping`); return; }
-    const { guild, channel } = location;
-    const guildId = guild.id;
+async function handleWarmup({ matchId, steamId }) {
+  if (!(await isBotEnabled())) { console.log(`[GSI] Warmup: Bot disabled — skipping`); return; }
+  const location = findVoiceChannelForSteam(steamId);
+  if (!location) { console.log(`[GSI] Warmup: ${steamId} not in any voice channel — skipping`); return; }
+  const { guild, channel } = location;
+  const guildId = guild.id;
 
-    // Guild-level cooldown — blocks ghost warmups after match end
-    const cooldownElapsed = isGuildInCooldown(guildId);
-    if (cooldownElapsed !== false) {
-      console.log(`[GSI] Warmup: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
-      return;
-    }
+  // Guild-level cooldown — blocks ghost warmups after match end
+  const cooldownElapsed = isGuildInCooldown(guildId);
+  if (cooldownElapsed !== false) {
+    console.log(`[GSI] Warmup: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
+    return;
+  }
 
-    if (activeSessions.has(guildId)) { console.log(`[GSI] Warmup: Already recording — ignoring`); return; }
-    if (pendingConnections.has(guildId)) { console.log(`[GSI] Warmup: Already pre-connected — ignoring`); return; }
+  if (activeSessions.has(guildId)) { console.log(`[GSI] Warmup: Already recording — ignoring`); return; }
+  if (pendingConnections.has(guildId)) { console.log(`[GSI] Warmup: Already pre-connected — ignoring`); return; }
 
-    try {
-      console.log(`[GSI] Warmup: Pre-connecting to ${channel.name}...`);
-      const connection = await preconnectVoice({ guildId, voiceChannel: channel });
-      const playerMap = buildPlayerMap(channel, "gsi");
-      pendingConnections.set(guildId, { connection, voiceChannel: channel, playerMap });
-      console.log(`[GSI] Warmup: Pre-connected to ${channel.name} — DAVE handshake complete, ready for match start`);
-    } catch (err) {
-      console.error(`[GSI] Warmup: Failed to pre-connect:`, err.message);
-    }
-  },
+  try {
+    console.log(`[GSI] Warmup: Pre-connecting to ${channel.name}...`);
+    const connection = await preconnectVoice({ guildId, voiceChannel: channel });
+    const playerMap = buildPlayerMap(channel, "gsi");
+    pendingConnections.set(guildId, { connection, voiceChannel: channel, playerMap });
+    console.log(`[GSI] Warmup: Pre-connected to ${channel.name} — DAVE handshake complete, ready for match start`);
+  } catch (err) {
+    console.error(`[GSI] Warmup: Failed to pre-connect:`, err.message);
+  }
+}
 
-  onMatchStart: async ({ matchId, steamId, startedAt }) => {
-    if (!client.isReady()) return;
-    if (!(await isBotEnabled())) { console.log(`[GSI] Live: Bot disabled — skipping`); return; }
-    const location = findVoiceChannelForSteam(steamId);
-    if (!location) { console.log(`[GSI] ${steamId} not in any voice channel — skipping`); return; }
-    const { guild, channel } = location;
-    const guildId = guild.id;
+async function handleMatchStart({ matchId, steamId, startedAt }) {
+  if (!(await isBotEnabled())) { console.log(`[GSI] Live: Bot disabled — skipping`); return; }
+  const location = findVoiceChannelForSteam(steamId);
+  if (!location) { console.log(`[GSI] ${steamId} not in any voice channel — skipping`); return; }
+  const { guild, channel } = location;
+  const guildId = guild.id;
 
-    // Guild-level cooldown — blocks ghost recordings after match end
-    const cooldownElapsed = isGuildInCooldown(guildId);
-    if (cooldownElapsed !== false) {
-      console.log(`[GSI] Live: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
-      // Clean up any pending connection from a ghost warmup that slipped through
-      if (pendingConnections.has(guildId)) {
-        const pending = pendingConnections.get(guildId);
-        pendingConnections.delete(guildId);
-        try { pending.connection.destroy(); } catch {}
-        console.log(`[GSI] Live: Cleaned up ghost pre-connection`);
-      }
-      return;
-    }
-
-    if (activeSessions.has(guildId)) { console.log(`[GSI] Already recording — ignoring`); return; }
-
-    const pending = pendingConnections.get(guildId);
-    pendingConnections.delete(guildId);
-
-    let existingConnection = null;
-    let playerMap;
-
-    if (pending) {
-      if (pending.connection.state.status === "ready") {
-        console.log(`[GSI] Using pre-connected voice channel from warmup (connection still ready)`);
-        existingConnection = pending.connection;
-      } else {
-        console.log(`[GSI] Pre-connected voice was ${pending.connection.state.status} — reconnecting`);
-        try { pending.connection.destroy(); } catch {}
-        existingConnection = null;
-      }
-      playerMap = buildPlayerMap(channel, "gsi");
-    } else {
-      console.log(`[GSI] No warmup pre-connection — connecting now`);
-      playerMap = buildPlayerMap(channel, "gsi");
-    }
-
-    const excludedDiscordIds = await getExcludedDiscordIds();
-    if (excludedDiscordIds.size > 0) {
-      console.log(`[GSI] Excluding ${excludedDiscordIds.size} player(s) from recording`);
-    }
-
-    try {
-      await startRecording({ guildId, voiceChannel: channel, matchId, playerMap, startedAt, existingConnection, excludedDiscordIds });
-    } catch (err) {
-      console.error(`[GSI] Failed to auto-start:`, err.message);
-    }
-  },
-
-  onMatchEnd: async ({ matchId, steamId }) => {
-    if (!client.isReady()) return;
-    const location = findVoiceChannelForSteam(steamId);
-    if (!location) return;
-    const guildId = location.guild.id;
-
+  // Guild-level cooldown — blocks ghost recordings after match end
+  const cooldownElapsed = isGuildInCooldown(guildId);
+  if (cooldownElapsed !== false) {
+    console.log(`[GSI] Live: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
+    // Clean up any pending connection from a ghost warmup that slipped through
     if (pendingConnections.has(guildId)) {
       const pending = pendingConnections.get(guildId);
       pendingConnections.delete(guildId);
       try { pending.connection.destroy(); } catch {}
-      // Also set cooldown when cleaning up a pre-connection
-      guildCooldowns.set(guildId, Date.now());
-      console.log(`[GSI] Cleaned up pre-connection (match ended without going live) — cooldown set`);
-      return;
+      console.log(`[GSI] Live: Cleaned up ghost pre-connection`);
     }
+    return;
+  }
 
-    if (!activeSessions.has(guildId)) return;
-    try {
-      await stopRecording(guildId);
-      // stopRecording already sets guildCooldowns
-    } catch (err) {
-      console.error(`[GSI] Failed to auto-stop:`, err.message);
-      // Set cooldown even on error to prevent ghost recordings
-      guildCooldowns.set(guildId, Date.now());
+  if (activeSessions.has(guildId)) { console.log(`[GSI] Already recording — ignoring`); return; }
+
+  const pending = pendingConnections.get(guildId);
+  pendingConnections.delete(guildId);
+
+  let existingConnection = null;
+  let playerMap;
+
+  if (pending) {
+    if (pending.connection.state.status === "ready") {
+      console.log(`[GSI] Using pre-connected voice channel from warmup (connection still ready)`);
+      existingConnection = pending.connection;
+    } else {
+      console.log(`[GSI] Pre-connected voice was ${pending.connection.state.status} — reconnecting`);
+      try { pending.connection.destroy(); } catch {}
+      existingConnection = null;
     }
-  },
+    playerMap = buildPlayerMap(channel, "gsi");
+  } else {
+    console.log(`[GSI] No warmup pre-connection — connecting now`);
+    playerMap = buildPlayerMap(channel, "gsi");
+  }
+
+  const excludedDiscordIds = await getExcludedDiscordIds();
+  if (excludedDiscordIds.size > 0) {
+    console.log(`[GSI] Excluding ${excludedDiscordIds.size} player(s) from recording`);
+  }
+
+  try {
+    await startRecording({ guildId, voiceChannel: channel, matchId, playerMap, startedAt, existingConnection, excludedDiscordIds });
+  } catch (err) {
+    console.error(`[GSI] Failed to auto-start:`, err.message);
+  }
+}
+
+async function handleMatchEnd({ matchId, steamId }) {
+  const location = findVoiceChannelForSteam(steamId);
+  if (!location) return;
+  const guildId = location.guild.id;
+
+  if (pendingConnections.has(guildId)) {
+    const pending = pendingConnections.get(guildId);
+    pendingConnections.delete(guildId);
+    try { pending.connection.destroy(); } catch {}
+    // Also set cooldown when cleaning up a pre-connection
+    guildCooldowns.set(guildId, Date.now());
+    console.log(`[GSI] Cleaned up pre-connection (match ended without going live) — cooldown set`);
+    return;
+  }
+
+  if (!activeSessions.has(guildId)) return;
+  try {
+    await stopRecording(guildId);
+    // stopRecording already sets guildCooldowns
+  } catch (err) {
+    console.error(`[GSI] Failed to auto-stop:`, err.message);
+    // Set cooldown even on error to prevent ghost recordings
+    guildCooldowns.set(guildId, Date.now());
+  }
+}
+
+// ─── GSI server ──────────────────────────────────────────────────────────────
+
+startGsiServer({
+  onWarmup: (event) => queueOrRun(handleWarmup, { ...event, type: "warmup" }),
+  onMatchStart: (event) => queueOrRun(handleMatchStart, { ...event, type: "matchStart" }),
+  onMatchEnd: (event) => queueOrRun(handleMatchEnd, { ...event, type: "matchEnd" }),
 });
 
 // ─── Slash commands ───────────────────────────────────────────────────────────
@@ -346,6 +375,10 @@ client.once("ready", async () => {
   } catch (err) {
     console.error("Failed to register commands:", err.message);
   }
+
+  // Mark client as ready and replay any GSI events that arrived during startup
+  clientReady = true;
+  replayQueuedEvents();
 });
 
 // ─── Interactions ─────────────────────────────────────────────────────────────
