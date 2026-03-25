@@ -12,6 +12,11 @@ const s3 = new S3Client({
 
 const BUCKET = process.env.S3_BUCKET || "cs2-voice-analytics";
 
+// Sanitize strings for use in S3 metadata headers (ASCII printable only)
+function sanitizeMetadata(value) {
+  return String(value).replace(/[^\x20-\x7E]/g, "");
+}
+
 export async function uploadSession({ matchId, audioFiles, startedAt }) {
   const prefix = `matches/${matchId}`;
 
@@ -21,7 +26,13 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
       Key: `${prefix}/audio_${steamId}.opus`,
       Body: createReadStream(filePath),
       ContentType: "audio/opus",
-      Metadata: { matchId, steamId, sampleRate: "48000", channels: "2", codec: "opus" },
+      Metadata: {
+        matchid: sanitizeMetadata(matchId),
+        steamid: sanitizeMetadata(steamId),
+        samplerate: "48000",
+        channels: "2",
+        codec: "opus",
+      },
     }))
   );
 
@@ -37,6 +48,7 @@ export async function uploadSession({ matchId, audioFiles, startedAt }) {
       audioKey: `${prefix}/audio_${steamId}.opus`,
     })),
     status: "pending_transcription",
+    statusUpdatedAt: new Date().toISOString(),
     createdAt: new Date().toISOString(),
   };
 
