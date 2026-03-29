@@ -644,6 +644,26 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	newMeta, err := getR2Json(ctx, newPrefix+"meta.json")
 	if err == nil {
 		newMeta["matchId"] = req.DemoMatchId
+
+		// Fix audioKey paths — they still point to the old prefix after copy
+		if players, ok := newMeta["players"].([]interface{}); ok {
+			for _, p := range players {
+				if pm, ok := p.(map[string]interface{}); ok {
+					if audioKey, ok := pm["audioKey"].(string); ok {
+						// Extract just the filename and rebuild with new prefix
+						parts := strings.Split(audioKey, "/")
+						filename := parts[len(parts)-1]
+						pm["audioKey"] = newPrefix + filename
+					}
+				}
+			}
+		}
+
+		// Also fix transcriptKey if present
+		if tk, ok := newMeta["transcriptKey"].(string); ok && strings.Contains(tk, best.matchId) {
+			newMeta["transcriptKey"] = strings.Replace(tk, best.matchId, req.DemoMatchId, 1)
+		}
+
 		putR2Json(ctx, newPrefix+"meta.json", newMeta)
 	}
 
