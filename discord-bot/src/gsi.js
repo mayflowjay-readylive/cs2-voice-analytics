@@ -22,6 +22,13 @@ const PHASE_GAMEOVER = "gameover";
 // immediately after a match ends, creating ghost recordings.
 const POST_GAMEOVER_COOLDOWN_MS = 90_000;
 
+// Game modes that should trigger recording.
+// Anything not in this set (deathmatch, casual, arms race, etc.) is ignored.
+const ALLOWED_MODES = new Set([
+  "competitive",    // Competitive and Premier matchmaking
+  "scrimcomp2v2",   // Wingman
+]);
+
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "auto",
   endpoint: process.env.S3_ENDPOINT,
@@ -165,16 +172,25 @@ export function startGsiServer({ onWarmup, onMatchStart, onMatchEnd }) {
     console.log(`✅ GSI + API server listening on port ${PORT}`);
   });
 
-  // Expose cooldown setter so index.js guild cooldown can work alongside this
   function handleGsiEvent(state, lastPhase, onWarmup, onMatchStart, onMatchEnd) {
     const steamId  = state.provider?.steamid;
     const mapPhase = state.map?.phase;
+    const mapMode  = state.map?.mode;
     const matchId  = state.map?.matchid || generateMatchId(state);
     if (!steamId || !mapPhase) return;
     const prev = lastPhase.get(steamId);
     if (prev === mapPhase) return;
     lastPhase.set(steamId, mapPhase);
-    console.log(`[GSI] steamId=${steamId} phase: ${prev ?? "unknown"} → ${mapPhase} (matchId: ${matchId})`);
+    console.log(`[GSI] steamId=${steamId} phase: ${prev ?? "unknown"} → ${mapPhase} (matchId: ${matchId}, mode: ${mapMode || "unknown"})`);
+
+    // Filter by game mode — only record competitive matches
+    if (mapMode && !ALLOWED_MODES.has(mapMode)) {
+      if (mapPhase === PHASE_WARMUP || mapPhase === PHASE_LIVE) {
+        console.log(`[GSI] Ignoring ${mapPhase} — game mode "${mapMode}" is not competitive`);
+        return;
+      }
+      // Still process gameover to reset cooldowns properly
+    }
 
     // Check global cooldown
     const now = Date.now();
