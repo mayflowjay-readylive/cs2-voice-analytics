@@ -5,6 +5,7 @@ import {
   ListObjectsV2Command,
   CopyObjectCommand,
   DeleteObjectCommand,
+  PutObjectCommand,
 } from "@aws-sdk/client-s3";
 
 const PORT = process.env.PORT || 3000;
@@ -63,6 +64,27 @@ async function renameSession(oldMatchId, newMatchId) {
     return s3.send(new CopyObjectCommand({ Bucket: BUCKET, CopySource: `${BUCKET}/${key}`, Key: newKey }));
   }));
   await Promise.all(keys.map(key => s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))));
+
+  // Update meta.json — fix matchId, audioKey paths, and transcriptKey
+  try {
+    const meta = await getR2Json(`${newPrefix}meta.json`);
+    meta.matchId = newMatchId;
+    if (meta.players) {
+      for (const p of meta.players) {
+        if (p.audioKey) {
+          const filename = p.audioKey.split("/").pop();
+          p.audioKey = `${newPrefix}${filename}`;
+        }
+      }
+    }
+    if (meta.transcriptKey && meta.transcriptKey.includes(oldMatchId)) {
+      meta.transcriptKey = meta.transcriptKey.replace(oldMatchId, newMatchId);
+    }
+    await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: `${newPrefix}meta.json`, Body: JSON.stringify(meta, null, 2), ContentType: "application/json" }));
+  } catch (err) {
+    console.warn(`[link] Failed to update meta.json after rename: ${err.message}`);
+  }
+
   console.log(`✅ Renamed session ${oldMatchId} → ${newMatchId}`);
 }
 
