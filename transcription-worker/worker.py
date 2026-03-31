@@ -25,7 +25,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# ─── Config ─────────────────────────────────────────────────────────────────
 
 S3_BUCKET     = os.environ.get("S3_BUCKET", "")
 S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
@@ -34,6 +34,13 @@ GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
 
 STALE_THRESHOLD_SECONDS = 900  # 15 minutes
 MAX_RETRIES = 3
+
+# WAV format constants for duration calculation
+WAV_SAMPLE_RATE = 48000
+WAV_CHANNELS = 2
+WAV_SAMPLE_WIDTH = 2  # 16-bit
+WAV_HEADER_SIZE = 44
+WAV_BYTES_PER_SECOND = WAV_SAMPLE_RATE * WAV_CHANNELS * WAV_SAMPLE_WIDTH
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -45,7 +52,7 @@ s3 = boto3.client(
     region_name=os.environ.get("AWS_REGION", "auto"),
 )
 
-# ─── Data types ───────────────────────────────────────────────────────────────
+# ─── Data types ─────────────────────────────────────────────────────────────
 
 @dataclass
 class Utterance:
@@ -56,7 +63,7 @@ class Utterance:
     confidence: float
 
 
-# ─── Audio decoding ───────────────────────────────────────────────────────────
+# ─── Audio decoding ─────────────────────────────────────────────────────────
 
 def opus_to_wav(opus_bytes: bytes) -> bytes:
     """Decode length-prefixed raw Opus packets to WAV (48kHz stereo 16-bit)."""
@@ -100,7 +107,14 @@ def opus_to_wav(opus_bytes: bytes) -> bytes:
     return wav_bytes
 
 
-# ─── Gemini transcription ─────────────────────────────────────────────────────
+def get_wav_duration(wav_bytes: bytes) -> float:
+    """Calculate WAV audio duration in seconds from raw WAV bytes."""
+    if len(wav_bytes) <= WAV_HEADER_SIZE:
+        return 0.0
+    return (len(wav_bytes) - WAV_HEADER_SIZE) / WAV_BYTES_PER_SECOND
+
+
+# ─── Gemini transcription ──────────────────────────────────────────────────
 
 # All known CS2 callouts and terms — used in prompt and cleanup pass
 CS2_CALLOUTS = [
@@ -195,8 +209,57 @@ Rules — fix ALL of the following issues:
 Return ONLY the corrected JSON array in the exact same format as input, no preamble or markdown."""
 
 
+def scale_timestamps(raw_utterances: list[dict], wav_duration: float) -> list[dict]:
+    """Scale Gemini's compressed timestamps to match actual audio duration.
+
+    Gemini ignores silence frames in the audio and returns timestamps relative
+    to speech content only. For a 2500s audio file, Gemini might return
+    timestamps in the 0-42s range. This function detects the compression
+    and scales timestamps proportionally to the actual audio duration.
+
+    Args:
+        raw_utterances: List of utterance dicts from Gemini with t_start/t_end
+        wav_duration: Actual WAV audio duration in seconds
+
+    Returns:
+        Same utterances with timestamps scaled to match audio duration
+    """
+    if not raw_utterances or wav_duration <= 0:
+        return raw_utterances
+
+    # Find the maximum timestamp Gemini returned
+    max_t = 0.0
+    for u in raw_utterances:
+        t_end = u.get("t_end", 0.0)
+        t_start = u.get("t_start", 0.0)
+        max_t = max(max_t, t_end, t_start)
+
+    if max_t <= 0:
+        return raw_utterances
+
+    # Calculate scaling factor
+    scale = wav_duration / max_t
+
+    # Only scale if timestamps are significantly compressed (>2x difference)
+    if scale <= 2.0:
+        log.info(f"  Timestamps OK (scale={scale:.1f}x, audio={wav_duration:.0f}s, gemini_max={max_t:.1f}s)")
+        return raw_utterances
+
+    log.info(f"  ⚡ Scaling timestamps by {scale:.1f}x (audio={wav_duration:.0f}s, gemini_max={max_t:.1f}s)")
+
+    for u in raw_utterances:
+        u["t_start"] = u.get("t_start", 0.0) * scale
+        u["t_end"] = u.get("t_end", 0.0) * scale
+
+    return raw_utterances
+
+
 def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None) -> list[Utterance]:
     """Upload WAV to Gemini Files API and transcribe."""
+    # Calculate audio duration BEFORE transcription (needed for timestamp scaling)
+    wav_duration = get_wav_duration(wav_bytes)
+    log.info(f"  Audio duration: {wav_duration:.1f}s ({wav_duration/60:.1f}min)")
+
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.write(wav_bytes)
     tmp.close()
@@ -236,6 +299,9 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
         text = response.text.strip().replace("```json", "").replace("```", "").strip()
         raw_utterances = json.loads(text)
         log.info(f"  Raw transcription: {len(raw_utterances)} utterances")
+
+        # Scale timestamps BEFORE cleanup (cleanup preserves timestamps)
+        raw_utterances = scale_timestamps(raw_utterances, wav_duration)
 
         # Post-processing cleanup pass
         raw_utterances = cleanup_transcript(raw_utterances)
@@ -285,7 +351,7 @@ def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
         return raw_utterances
 
 
-# ─── S3 helpers ───────────────────────────────────────────────────────────────
+# ─── S3 helpers ─────────────────────────────────────────────────────────────
 
 def list_pending_sessions() -> list[str]:
     pending = []
@@ -315,7 +381,6 @@ def check_stale_sessions():
                 if meta.get("status") != "transcribing":
                     continue
 
-                # Check staleness using statusUpdatedAt, fall back to S3 LastModified
                 updated_at = None
                 if meta.get("statusUpdatedAt"):
                     updated_at = datetime.fromisoformat(meta["statusUpdatedAt"].replace("Z", "+00:00"))
@@ -359,7 +424,7 @@ def set_status(match_id: str, status: str, extra: dict = None):
     )
 
 
-# ─── Main processing ──────────────────────────────────────────────────────────
+# ─── Main processing ────────────────────────────────────────────────────────
 
 def process_session(match_id: str):
     log.info(f"Processing match: {match_id}")
@@ -436,7 +501,6 @@ def main():
     log.info("🎙️ Transcription worker started (Gemini)")
     while True:
         try:
-            # Check for stuck sessions first
             check_stale_sessions()
 
             pending = list_pending_sessions()
