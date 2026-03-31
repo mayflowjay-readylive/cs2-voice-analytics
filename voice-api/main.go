@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,6 +51,7 @@ func main() {
 	mux.HandleFunc("/sessions/link", handleSessionsLink)
 	mux.HandleFunc("/bot/enabled", handleBotEnabled)
 	mux.HandleFunc("/bot/excluded-players", handleExcludedPlayers)
+	mux.HandleFunc("/pipeline/recent", handlePipelineRecent)
 
 	handler := corsMiddleware(mux)
 
@@ -184,6 +186,15 @@ func deleteR2Object(ctx context.Context, key string) error {
 	return err
 }
 
+// r2ObjectExists returns true if the key exists in R2.
+func r2ObjectExists(ctx context.Context, key string) bool {
+	_, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	return err == nil
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +230,10 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	serveR2JSON(w, r, fmt.Sprintf("matches/%s/meta.json", matchID))
 }
 
-// ─── /retry/{matchId} handler ────────────────────────────────────────────
+// ─── /retry/{matchId} ────────────────────────────────────────────────────────
+//
+// Smart retry: checks whether transcript.json actually exists before deciding
+// whether to reset to pending_alignment or pending_transcription.
 
 func handleRetry(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
@@ -237,11 +251,11 @@ func handleRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	key := fmt.Sprintf("matches/%s/meta.json", matchID)
-	data, err := getR2Json(ctx, key)
+	metaKey := fmt.Sprintf("matches/%s/meta.json", matchID)
+	data, err := getR2Json(ctx, metaKey)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(404)
@@ -250,18 +264,42 @@ func handleRetry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentStatus, _ := data["status"].(string)
+
+	// Determine the correct restart point by checking which files actually exist.
+	transcriptKey := fmt.Sprintf("matches/%s/transcript.json", matchID)
+	hasTranscript := r2ObjectExists(ctx, transcriptKey)
+
 	var newStatus string
+	var reason string
 
 	switch {
-	case strings.HasPrefix(currentStatus, "error_transcription"):
+	case strings.HasPrefix(currentStatus, "error_transcription"),
+		currentStatus == "transcribing":
 		newStatus = "pending_transcription"
-	case strings.HasPrefix(currentStatus, "error_alignment"):
-		newStatus = "pending_alignment"
-	case strings.HasPrefix(currentStatus, "error_analysis"):
+		reason = "resetting to transcription"
+
+	case strings.HasPrefix(currentStatus, "error_alignment"),
+		currentStatus == "aligning":
+		if hasTranscript {
+			newStatus = "pending_alignment"
+			reason = "transcript exists — resetting to alignment"
+		} else {
+			newStatus = "pending_transcription"
+			reason = "transcript missing — resetting to transcription"
+		}
+
+	case strings.HasPrefix(currentStatus, "error_analysis"),
+		currentStatus == "analyzing":
 		newStatus = "pending_analysis"
+		reason = "resetting to analysis"
+
 	case currentStatus == "complete":
 		newStatus = "pending_analysis"
-	case currentStatus == "pending_transcription", currentStatus == "pending_alignment", currentStatus == "pending_analysis":
+		reason = "re-running analysis"
+
+	case currentStatus == "pending_transcription",
+		currentStatus == "pending_alignment",
+		currentStatus == "pending_analysis":
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -270,8 +308,16 @@ func handleRetry(w http.ResponseWriter, r *http.Request) {
 			"message": "Already pending — pipeline will pick it up shortly",
 		})
 		return
+
 	default:
-		newStatus = "pending_alignment"
+		// Unknown status — use file presence to decide
+		if hasTranscript {
+			newStatus = "pending_alignment"
+			reason = "unknown status, transcript exists — resetting to alignment"
+		} else {
+			newStatus = "pending_transcription"
+			reason = "unknown status, no transcript — resetting to transcription"
+		}
 	}
 
 	data["status"] = newStatus
@@ -279,14 +325,14 @@ func handleRetry(w http.ResponseWriter, r *http.Request) {
 	delete(data, "error")
 	data["retryCount"] = 0
 
-	if err := putR2Json(ctx, key, data); err != nil {
+	if err := putR2Json(ctx, metaKey, data); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	log.Printf("🔄 Retry triggered for %s: %s → %s", matchID, currentStatus, newStatus)
+	log.Printf("🔄 Retry for %s: %s → %s (%s)", matchID, currentStatus, newStatus, reason)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
@@ -294,7 +340,127 @@ func handleRetry(w http.ResponseWriter, r *http.Request) {
 		"matchId":        matchID,
 		"previousStatus": currentStatus,
 		"newStatus":      newStatus,
+		"reason":         reason,
 		"message":        "Pipeline will retry within 30 seconds",
+	})
+}
+
+// ─── /pipeline/recent ────────────────────────────────────────────────────────
+//
+// Returns the N most recent matches with their pipeline status, per-player
+// transcription progress, file presence flags, and any recorded errors.
+// Used by the Lovable frontend to show a match health dashboard.
+
+func handlePipelineRecent(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(204)
+		return
+	}
+	if r.Method != "GET" {
+		http.Error(w, `{"error":"method not allowed"}`, 405)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	prefixes, err := listR2Prefixes(ctx, "matches/", "/")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	type matchSummary struct {
+		MatchID                string                 `json:"matchId"`
+		Status                 string                 `json:"status"`
+		StatusUpdatedAt        string                 `json:"statusUpdatedAt"`
+		Map                    string                 `json:"map,omitempty"`
+		PlayerCount            int                    `json:"playerCount"`
+		CompletedPlayers       int                    `json:"completedPlayers"`
+		Error                  string                 `json:"error,omitempty"`
+		RetryCount             int                    `json:"retryCount"`
+		TranscriptionProgress  map[string]interface{} `json:"transcriptionProgress,omitempty"`
+		HasTranscript          bool                   `json:"hasTranscript"`
+		HasAnalysis            bool                   `json:"hasAnalysis"`
+		HasErrors              bool                   `json:"hasErrors"`
+		RecordingStartMs       int64                  `json:"recordingStartMs,omitempty"`
+	}
+
+	var summaries []matchSummary
+
+	for _, prefix := range prefixes {
+		matchID := strings.Trim(strings.TrimPrefix(prefix, "matches/"), "/")
+		if matchID == "" {
+			continue
+		}
+
+		meta, err := getR2Json(ctx, prefix+"meta.json")
+		if err != nil {
+			continue
+		}
+
+		ms := matchSummary{
+			MatchID: matchID,
+		}
+
+		ms.Status, _ = meta["status"].(string)
+		ms.StatusUpdatedAt, _ = meta["statusUpdatedAt"].(string)
+		ms.Map, _ = meta["map"].(string)
+		ms.Error, _ = meta["error"].(string)
+
+		if rc, ok := meta["retryCount"].(float64); ok {
+			ms.RetryCount = int(rc)
+		}
+		if rs, ok := meta["recordingStartMs"].(float64); ok {
+			ms.RecordingStartMs = int64(rs)
+		}
+
+		if players, ok := meta["players"].([]interface{}); ok {
+			ms.PlayerCount = len(players)
+		}
+
+		if tp, ok := meta["transcriptionProgress"].(map[string]interface{}); ok {
+			ms.TranscriptionProgress = tp
+			done := 0
+			for _, v := range tp {
+				if vm, ok := v.(map[string]interface{}); ok {
+					if s, _ := vm["status"].(string); s == "done" || s == "skipped_too_short" || s == "skipped_no_audio" {
+						done++
+					}
+				}
+			}
+			ms.CompletedPlayers = done
+		}
+
+		// Check file presence (fast HeadObject calls)
+		ms.HasTranscript = r2ObjectExists(ctx, fmt.Sprintf("matches/%s/transcript.json", matchID))
+		ms.HasAnalysis = r2ObjectExists(ctx, fmt.Sprintf("matches/%s/analysis.json", matchID))
+		ms.HasErrors = r2ObjectExists(ctx, fmt.Sprintf("matches/%s/errors.json", matchID))
+
+		summaries = append(summaries, ms)
+	}
+
+	// Sort by statusUpdatedAt descending (most recently updated first)
+	sort.Slice(summaries, func(i, j int) bool {
+		ti, _ := time.Parse(time.RFC3339, summaries[i].StatusUpdatedAt)
+		tj, _ := time.Parse(time.RFC3339, summaries[j].StatusUpdatedAt)
+		return ti.After(tj)
+	})
+
+	// Limit to 30 most recent
+	if len(summaries) > 30 {
+		summaries = summaries[:30]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"matches":     summaries,
+		"total":       len(summaries),
+		"generatedAt": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -431,7 +597,7 @@ func handleExcludedPlayers(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, `{"error":"method not allowed"}`, 405)
 }
 
-// ─── /sessions/link handler (smart matching by player overlap + time) ─────────
+// ─── /sessions/link handler ───────────────────────────────────────────────────
 
 func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
@@ -485,7 +651,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	}
 	targetMs := targetTs.UnixMilli()
 
-	// Build a set of demo player Steam IDs for smart matching
 	demoPlayers := make(map[string]bool)
 	for _, pid := range req.PlayerIds {
 		if pid != "" && !strings.HasPrefix(pid, "discord_") {
@@ -493,7 +658,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If no playerIds were sent, try to load them from parse_result.json
 	if len(demoPlayers) == 0 {
 		parseKey := "matches/" + req.DemoMatchId + "/parse_result.json"
 		if prData, err := getR2Json(ctx, parseKey); err == nil {
@@ -511,7 +675,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[link] Matching for %s (time: %s, demo players: %d)", req.DemoMatchId, targetTs.Format(time.RFC3339), len(demoPlayers))
 
-	// List all voice sessions
 	prefixes, err := listR2Prefixes(ctx, "matches/", "/")
 	if err != nil {
 		log.Printf("[link] List error: %v", err)
@@ -557,7 +720,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Extract player Steam IDs from voice session
 		var voicePlayers []string
 		if players, ok := meta["players"].([]interface{}); ok {
 			for _, p := range players {
@@ -569,7 +731,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Count player overlap
 		overlap := 0
 		if len(demoPlayers) > 0 {
 			for _, vid := range voicePlayers {
@@ -579,7 +740,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Score: prioritize player overlap, then time proximity
 		timeDiffSec := float64(diff) / 1000.0
 		score := float64(overlap)*1000.0 - timeDiffSec
 
@@ -600,7 +760,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sort by score descending (highest overlap + closest time wins)
 	best := candidates[0]
 	for _, c := range candidates[1:] {
 		if c.score > best.score {
@@ -611,7 +770,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[link] Best match: %s (overlap: %d/%d players, timeDiff: %ds, score: %.1f)",
 		best.matchId, best.playerOverlap, len(demoPlayers), best.timeDiff/1000, best.score)
 
-	// Rename session
 	oldPrefix := "matches/" + best.matchId + "/"
 	newPrefix := "matches/" + req.DemoMatchId + "/"
 
@@ -645,12 +803,10 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		newMeta["matchId"] = req.DemoMatchId
 
-		// Fix audioKey paths — they still point to the old prefix after copy
 		if players, ok := newMeta["players"].([]interface{}); ok {
 			for _, p := range players {
 				if pm, ok := p.(map[string]interface{}); ok {
 					if audioKey, ok := pm["audioKey"].(string); ok {
-						// Extract just the filename and rebuild with new prefix
 						parts := strings.Split(audioKey, "/")
 						filename := parts[len(parts)-1]
 						pm["audioKey"] = newPrefix + filename
@@ -659,7 +815,6 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Also fix transcriptKey if present
 		if tk, ok := newMeta["transcriptKey"].(string); ok && strings.Contains(tk, best.matchId) {
 			newMeta["transcriptKey"] = strings.Replace(tk, best.matchId, req.DemoMatchId, 1)
 		}
