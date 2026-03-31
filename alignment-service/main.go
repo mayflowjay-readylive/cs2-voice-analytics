@@ -598,16 +598,26 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	prefix := "matches/" + matchID
 	log.Printf("Aligning match: %s", matchID)
 
-	// Load meta first to check session age before setting aligning status
+	// Load meta first to check timing before setting aligning status
 	var rawMeta map[string]interface{}
 	if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &rawMeta); err != nil {
 		return fmt.Errorf("load meta: %w", err)
 	}
 
-	// Calculate session age from startedAt
-	sessionAge := time.Duration(0)
-	if startedAt, ok := rawMeta["startedAt"].(float64); ok {
-		sessionAge = time.Since(time.UnixMilli(int64(startedAt)))
+	// Calculate how long since this session entered pending_alignment.
+	// This is the correct clock — NOT startedAt, because transcription
+	// can take 30+ minutes, making startedAt unreliable for patience.
+	pendingAge := time.Duration(0)
+	if ts, ok := rawMeta["statusUpdatedAt"].(string); ok && ts != "" {
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			pendingAge = time.Since(parsed)
+		}
+	}
+	// Fallback to startedAt if statusUpdatedAt is missing
+	if pendingAge == 0 {
+		if startedAt, ok := rawMeta["startedAt"].(float64); ok {
+			pendingAge = time.Since(time.UnixMilli(int64(startedAt)))
+		}
 	}
 
 	// Set intermediate status
@@ -652,10 +662,10 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 			// No parse_result.json AND no demo found.
 			// Check if the session is still young — the voice-link-worker
 			// might not have renamed the session yet.
-			if sessionAge < waitForDataTimeout {
-				waitRemaining := waitForDataTimeout - sessionAge
-				log.Printf("  ⏳ No data available yet (session is %s old). Waiting for voice-link — will retry for %s more.",
-					sessionAge.Round(time.Second), waitRemaining.Round(time.Second))
+			if pendingAge < waitForDataTimeout {
+				waitRemaining := waitForDataTimeout - pendingAge
+				log.Printf("  ⏳ No data available yet (pending for %s). Waiting for voice-link — will retry for %s more.",
+					pendingAge.Round(time.Second), waitRemaining.Round(time.Second))
 				log.Printf("     The voice-link-worker may still rename this session and upload parse_result.json.")
 
 				// Set back to pending_alignment so we try again on next poll
@@ -663,9 +673,9 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 				return errNotReadyYet
 			}
 
-			// Session is old enough — give up
-			log.Printf("  ❌ Session is %s old (past %s timeout) — no data arrived. Giving up.",
-				sessionAge.Round(time.Second), waitForDataTimeout)
+			// Session has been pending long enough — give up
+			log.Printf("  ❌ Pending for %s (past %s timeout) — no data arrived. Giving up.",
+				pendingAge.Round(time.Second), waitForDataTimeout)
 			return fmt.Errorf("find demo: %w", err)
 		}
 
