@@ -296,7 +296,11 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
         except Exception:
             pass
 
-        text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        text = response.text if response.text else None
+        if not text:
+            log.warning(f"  Gemini returned empty response for {steam_id}")
+            return []
+        text = text.strip().replace("```json", "").replace("```", "").strip()
         raw_utterances = json.loads(text)
         log.info(f"  Raw transcription: {len(raw_utterances)} utterances")
 
@@ -343,6 +347,9 @@ def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
         ),
     )
 
+    if not response.text:
+        log.warning(f"  Cleanup pass returned empty response, using original")
+        return raw_utterances
     text = response.text.strip().replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(text)
