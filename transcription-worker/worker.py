@@ -12,6 +12,8 @@ Resilience improvements:
  - Per-player transcription progress tracked in meta.json
  - Full Gemini diagnostics logged on empty/failed response
  - Retry on empty Gemini response (up to MAX_GEMINI_RETRIES attempts)
+ - Discord webhook alert posted when a session fails
+ - errors.json written to matches/{id}/ on every failure (permanent log)
 """
 
 import os
@@ -21,6 +23,7 @@ import logging
 import struct
 import wave
 import tempfile
+import urllib.request
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
@@ -34,10 +37,11 @@ log = logging.getLogger(__name__)
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
-S3_BUCKET     = os.environ.get("S3_BUCKET", "")
-S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
-GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
+S3_BUCKET             = os.environ.get("S3_BUCKET", "")
+S3_ENDPOINT           = os.environ.get("S3_ENDPOINT")
+POLL_INTERVAL         = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
+GEMINI_MODEL          = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
+DISCORD_WEBHOOK_URL   = os.environ.get("DISCORD_WEBHOOK_URL", "")  # optional
 
 STALE_THRESHOLD_SECONDS = 900   # 15 minutes
 MAX_RETRIES             = 3     # stale-session retries
@@ -69,6 +73,72 @@ class Utterance:
     t_end: float
     text: str
     confidence: float
+
+
+# ─── Discord alerting ────────────────────────────────────────────────────────
+
+def send_discord_alert(title: str, description: str, color: int = 0xFF4444) -> None:
+    """Post an embed to the Discord webhook. Silently no-ops if no webhook is configured."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        payload = json.dumps({
+            "embeds": [{
+                "title": title,
+                "description": description,
+                "color": color,
+                "footer": {"text": "CS2 Voice Analytics — Transcription Worker"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }).encode()
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status not in (200, 204):
+                log.warning(f"Discord webhook returned {resp.status}")
+    except Exception as e:
+        log.warning(f"Discord alert failed (non-fatal): {e}")
+
+
+# ─── Persistent error log ────────────────────────────────────────────────────
+
+def append_error_log(match_id: str, stage: str, error: str, steam_id: str = None) -> None:
+    """Append an error entry to matches/{match_id}/errors.json in R2.
+
+    This file persists indefinitely and is the first place to look when
+    diagnosing a failed session.
+    """
+    key = f"matches/{match_id}/errors.json"
+    existing = []
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        existing = json.loads(obj["Body"].read())
+    except Exception:
+        pass  # File doesn't exist yet — that's fine
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": stage,
+        "error": error,
+    }
+    if steam_id:
+        entry["steamId"] = steam_id
+
+    existing.append(entry)
+
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=json.dumps(existing, indent=2),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        log.warning(f"Could not write errors.json for {match_id}: {e}")
 
 
 # ─── Audio decoding ─────────────────────────────────────────────────────────
@@ -153,7 +223,7 @@ CS2_CALLOUTS = [
 
 
 def build_transcription_prompt(map_name: str = None) -> str:
-    map_line    = f"Map: {map_name}" if map_name else "Map: unknown (could be any CS2 map)"
+    map_line     = f"Map: {map_name}" if map_name else "Map: unknown (could be any CS2 map)"
     callout_list = ", ".join(f'"{c}"' for c in CS2_CALLOUTS)
     return f"""This is a voice recording from a CS2 (Counter-Strike 2) match.
 The player is speaking Danish, frequently mixing in English CS2 terms.
@@ -183,7 +253,7 @@ Return ONLY a JSON array with this exact schema, no preamble or markdown:
 If there is silence or no speech, return an empty array: []
 """
 
-# NOTE: {transcript_json} MUST be present — the transcript is injected below in cleanup_transcript()
+# NOTE: {transcript_json} is injected by cleanup_transcript() below
 CLEANUP_PROMPT = """You are a transcript editor for CS2 voice recordings in Danish.
 The following transcript was auto-generated from a Danish CS2 voice recording.
 It may contain transcription errors that need fixing.
@@ -251,8 +321,8 @@ def _log_gemini_diagnostics(response, attempt: int, steam_id: str) -> None:
     try:
         candidates = getattr(response, "candidates", None) or []
         if candidates:
-            c             = candidates[0]
-            finish_reason = getattr(c, "finish_reason", "UNKNOWN")
+            c              = candidates[0]
+            finish_reason  = getattr(c, "finish_reason", "UNKNOWN")
             safety_ratings = getattr(c, "safety_ratings", [])
             log.warning(f"      finish_reason  : {finish_reason}")
             log.warning(f"      safety_ratings : {safety_ratings}")
@@ -297,8 +367,8 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
         if audio_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {audio_file.state}")
 
-        prompt      = build_transcription_prompt(map_name)
-        last_error  = None
+        prompt     = build_transcription_prompt(map_name)
+        last_error = None
 
         for attempt in range(1, MAX_GEMINI_RETRIES + 1):
             if attempt > 1:
@@ -361,7 +431,7 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
                 if u.get("text", "").strip()
             ]
 
-        # All retries exhausted — clean up Gemini file before raising
+        # All retries exhausted
         try:
             client.files.delete(name=audio_file.name)
         except Exception:
@@ -382,7 +452,7 @@ def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
 
     callout_list = ", ".join(f'"{c}"' for c in CS2_CALLOUTS)
     prompt = CLEANUP_PROMPT.format(
-        callout_list   = callout_list,
+        callout_list    = callout_list,
         transcript_json = json.dumps(raw_utterances, ensure_ascii=False, indent=2),
     )
 
@@ -398,10 +468,10 @@ def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
         )
 
         if not response.text or not response.text.strip():
-            log.warning(f"  Cleanup pass returned empty response — keeping original")
+            log.warning(f"  Cleanup pass returned empty — keeping original")
             return raw_utterances
 
-        text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        text    = response.text.strip().replace("```json", "").replace("```", "").strip()
         cleaned = json.loads(text)
         log.info(f"  Cleanup: {len(raw_utterances)} → {len(cleaned)} utterances")
         return cleaned
@@ -454,13 +524,23 @@ def check_stale_sessions():
                 retry_count = meta.get("retryCount", 0)
 
                 if retry_count >= MAX_RETRIES:
-                    log.warning(f"⛔ Session {match_id} stuck in 'transcribing' after {MAX_RETRIES} retries — marking as error")
-                    set_status(match_id, "error_transcription", {
-                        "error": f"Stuck in transcribing after {MAX_RETRIES} retries"
-                    })
+                    msg = f"Stuck in transcribing after {MAX_RETRIES} retries"
+                    log.warning(f"⛔ Session {match_id}: {msg}")
+                    set_status(match_id, "error_transcription", {"error": msg})
+                    append_error_log(match_id, "stale_session", msg)
+                    send_discord_alert(
+                        title=f"⛔ Transcription permanently failed",
+                        description=(
+                            f"**Match:** `{match_id}`\n"
+                            f"**Reason:** Stuck in `transcribing` after {MAX_RETRIES} retries\n"
+                            f"**Age:** {int(age.total_seconds() / 60)} minutes\n\n"
+                            f"Use the retry button in the app or check `errors.json` in R2."
+                        ),
+                        color=0xFF0000,
+                    )
                 else:
                     log.warning(
-                        f"🔄 Session {match_id} stuck in 'transcribing' for {int(age.total_seconds())}s"
+                        f"🔄 Session {match_id} stuck for {int(age.total_seconds())}s"
                         f" — resetting (retry {retry_count + 1}/{MAX_RETRIES})"
                     )
                     set_status(match_id, "pending_transcription", {"retryCount": retry_count + 1})
@@ -475,7 +555,7 @@ def get_meta(match_id: str) -> dict:
 
 
 def set_status(match_id: str, status: str, extra: dict = None):
-    meta          = get_meta(match_id)
+    meta           = get_meta(match_id)
     meta["status"] = status
     meta["statusUpdatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if extra:
@@ -530,9 +610,9 @@ def process_session(match_id: str):
     map_name = meta.get("map")
 
     # ── Resume from partial transcript if a previous run crashed ─────────────
-    partial_key           = f"matches/{match_id}/transcript_partial.json"
-    completed_steam_ids   : set[str] = set()
-    all_utterances        : list[dict] = []
+    partial_key         = f"matches/{match_id}/transcript_partial.json"
+    completed_steam_ids : set[str]  = set()
+    all_utterances      : list[dict] = []
 
     if r2_object_exists(partial_key):
         try:
@@ -548,15 +628,15 @@ def process_session(match_id: str):
         except Exception as e:
             log.warning(f"  Could not load partial transcript ({e}) — starting fresh")
 
-    # ── Track audio keys that are safe to delete after transcript is written ──
+    # ── Track audio keys safe to delete after transcript is written ───────────
     audio_keys_to_delete : list[str] = []
+    player_errors        : list[str] = []
 
     # ── Per-player transcription ──────────────────────────────────────────────
     for player in meta["players"]:
         steam_id  = player["steamId"]
         audio_key = player["audioKey"]
 
-        # Already done in a previous run — still queue audio for deletion
         if steam_id in completed_steam_ids:
             log.info(f"  ✅ {steam_id} already transcribed — skipping")
             audio_keys_to_delete.append(audio_key)
@@ -570,9 +650,11 @@ def process_session(match_id: str):
             audio_bytes = audio_obj["Body"].read()
             log.info(f"  Audio size: {len(audio_bytes) / 1024:.1f} KB")
         except Exception as e:
-            log.error(f"  Failed to download audio for {steam_id}: {e}")
-            update_player_progress(match_id, steam_id, "error_download", error=str(e))
-            # Do NOT delete — audio may still be intact for a manual retry
+            msg = f"Failed to download audio: {e}"
+            log.error(f"  {steam_id}: {msg}")
+            update_player_progress(match_id, steam_id, "error_download", error=msg)
+            append_error_log(match_id, "download", msg, steam_id=steam_id)
+            player_errors.append(f"`{steam_id}`: download failed — {e}")
             continue
 
         if len(audio_bytes) < 1024:
@@ -586,8 +668,11 @@ def process_session(match_id: str):
         try:
             wav_bytes = opus_to_wav(audio_bytes)
         except Exception as e:
-            log.error(f"  Opus decode failed for {steam_id}: {e}")
-            update_player_progress(match_id, steam_id, "error_decode", error=str(e))
+            msg = f"Opus decode failed: {e}"
+            log.error(f"  {steam_id}: {msg}")
+            update_player_progress(match_id, steam_id, "error_decode", error=msg)
+            append_error_log(match_id, "decode", msg, steam_id=steam_id)
+            player_errors.append(f"`{steam_id}`: decode failed — {e}")
             continue
 
         if not wav_bytes:
@@ -603,8 +688,11 @@ def process_session(match_id: str):
             utterances = transcribe_with_gemini(wav_bytes, steam_id, map_name)
             log.info(f"  → {len(utterances)} utterances for {steam_id}")
         except Exception as e:
-            log.error(f"  Transcription failed for {steam_id}: {e}")
-            update_player_progress(match_id, steam_id, "error_transcription", error=str(e))
+            msg = str(e)
+            log.error(f"  Transcription failed for {steam_id}: {msg}")
+            update_player_progress(match_id, steam_id, "error_transcription", error=msg)
+            append_error_log(match_id, "transcription", msg, steam_id=steam_id)
+            player_errors.append(f"`{steam_id}`: transcription failed — {msg}")
             # Do NOT delete audio on transcription failure — keep for debugging
             continue
 
@@ -632,6 +720,22 @@ def process_session(match_id: str):
         except Exception as e:
             log.warning(f"  Could not save partial transcript: {e}")
 
+    # ── Send Discord alert if any players failed ──────────────────────────────
+    if player_errors:
+        map_label = meta.get("map", "unknown map")
+        send_discord_alert(
+            title=f"⚠️ Transcription errors on {map_label}",
+            description=(
+                f"**Match:** `{match_id}`\n"
+                f"**Map:** {map_label}\n"
+                f"**Failed players ({len(player_errors)}/{len(meta['players'])}):**\n"
+                + "\n".join(f"- {e}" for e in player_errors)
+                + f"\n\n**Completed:** {len(completed_steam_ids)}/{len(meta['players'])} players, {len(all_utterances)} utterances\n"
+                + "Check `errors.json` in R2 for full details. Use retry button in app if needed."
+            ),
+            color=0xFF8800,
+        )
+
     # ── Sort utterances by time ───────────────────────────────────────────────
     all_utterances.sort(key=lambda u: u.get("t_start", 0))
 
@@ -656,8 +760,20 @@ def process_session(match_id: str):
         )
         log.info(f"  ✅ transcript.json written: {len(all_utterances)} utterances from {len(completed_steam_ids)}/{len(meta['players'])} players")
     except Exception as e:
-        log.error(f"  ❌ Failed to write transcript.json: {e}")
-        set_status(match_id, "error_transcription", {"error": f"Could not write transcript.json: {e}"})
+        msg = f"Could not write transcript.json: {e}"
+        log.error(f"  ❌ {msg}")
+        append_error_log(match_id, "transcript_write", msg)
+        set_status(match_id, "error_transcription", {"error": msg})
+        send_discord_alert(
+            title=f"❌ Transcription failed — could not write transcript",
+            description=(
+                f"**Match:** `{match_id}`\n"
+                f"**Map:** {meta.get('map', 'unknown')}\n"
+                f"**Error:** {e}\n\n"
+                "Audio files have NOT been deleted. Use retry button in app."
+            ),
+            color=0xFF0000,
+        )
         return
 
     # ── ONLY delete audio AFTER transcript.json is confirmed written ──────────
@@ -668,7 +784,7 @@ def process_session(match_id: str):
         except Exception as e:
             log.warning(f"  Failed to delete audio {audio_key}: {e}")
 
-    # ── Clean up partial transcript now that final is written ─────────────────
+    # ── Clean up partial transcript ───────────────────────────────────────────
     try:
         s3.delete_object(Bucket=S3_BUCKET, Key=partial_key)
     except Exception:
@@ -680,7 +796,10 @@ def process_session(match_id: str):
         "transcribedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
 
-    log.info(f"✅ Transcription complete for {match_id}: {len(all_utterances)} utterances from {len(completed_steam_ids)}/{len(meta['players'])} players")
+    log.info(
+        f"✅ Transcription complete for {match_id}: "
+        f"{len(all_utterances)} utterances from {len(completed_steam_ids)}/{len(meta['players'])} players"
+    )
 
 
 def main():
@@ -696,11 +815,27 @@ def main():
                     try:
                         process_session(match_id)
                     except Exception as e:
-                        log.error(f"Error processing {match_id}: {e}")
+                        msg = str(e)
+                        log.error(f"Error processing {match_id}: {msg}")
+                        append_error_log(match_id, "process_session", msg)
                         try:
-                            set_status(match_id, "error_transcription", {"error": str(e)})
+                            set_status(match_id, "error_transcription", {"error": msg})
                         except Exception:
                             pass
+                        try:
+                            meta = get_meta(match_id)
+                        except Exception:
+                            meta = {}
+                        send_discord_alert(
+                            title=f"❌ Transcription session crashed",
+                            description=(
+                                f"**Match:** `{match_id}`\n"
+                                f"**Map:** {meta.get('map', 'unknown')}\n"
+                                f"**Error:** {msg}\n\n"
+                                "Check Railway logs and `errors.json` in R2. Use retry button in app."
+                            ),
+                            color=0xFF0000,
+                        )
             else:
                 log.debug("No pending sessions, sleeping…")
         except Exception as e:
