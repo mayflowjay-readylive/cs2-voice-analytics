@@ -598,25 +598,18 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	prefix := "matches/" + matchID
 	log.Printf("Aligning match: %s", matchID)
 
-	// Load meta first to check timing before setting aligning status
+	// Load meta first to check session age before setting aligning status
 	var rawMeta map[string]interface{}
 	if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &rawMeta); err != nil {
 		return fmt.Errorf("load meta: %w", err)
 	}
 
-	// Calculate how long since this session entered pending_alignment.
-	// This is the correct clock — NOT startedAt, because transcription
-	// can take 30+ minutes, making startedAt unreliable for patience.
+	// Calculate how long this session has been pending alignment
+	// (uses statusUpdatedAt — when transcription finished — not startedAt)
 	pendingAge := time.Duration(0)
 	if ts, ok := rawMeta["statusUpdatedAt"].(string); ok && ts != "" {
-		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-			pendingAge = time.Since(parsed)
-		}
-	}
-	// Fallback to startedAt if statusUpdatedAt is missing
-	if pendingAge == 0 {
-		if startedAt, ok := rawMeta["startedAt"].(float64); ok {
-			pendingAge = time.Since(time.UnixMilli(int64(startedAt)))
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			pendingAge = time.Since(t)
 		}
 	}
 
@@ -673,7 +666,7 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 				return errNotReadyYet
 			}
 
-			// Session has been pending long enough — give up
+			// Session is old enough — give up
 			log.Printf("  ❌ Pending for %s (past %s timeout) — no data arrived. Giving up.",
 				pendingAge.Round(time.Second), waitForDataTimeout)
 			return fmt.Errorf("find demo: %w", err)
@@ -697,8 +690,31 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 		}
 	}
 
-	// Alignment offset
+	// ── Compute alignment offset ──
+	// Recording starts when GSI fires "live" (≈ round 1 start).
+	// Demo time 0 is demo file start (during warmup, before round 1).
+	// We estimate how many demo-seconds elapsed before the recording started.
 	alignmentOffset := 0.0
+	if len(parsed.KillEvents) > 0 {
+		earliestKill := parsed.KillEvents[0].TimeSeconds
+		for _, ke := range parsed.KillEvents {
+			if ke.TimeSeconds < earliestKill && ke.TimeSeconds > 0 {
+				earliestKill = ke.TimeSeconds
+			}
+		}
+		// First kill is typically 40-60s after round start (freeze + buy + play).
+		// Recording t=0 ≈ demo t=(earliestKill - 50).
+		estimatedRecordingStartInDemo := earliestKill - 50.0
+		if estimatedRecordingStartInDemo < 0 {
+			estimatedRecordingStartInDemo = 0
+		}
+		// gameTime = utt.TStart - alignmentOffset
+		// We want utt.TStart=0 → gameTime=estimatedRecordingStartInDemo
+		// So: alignmentOffset = -estimatedRecordingStartInDemo
+		alignmentOffset = -estimatedRecordingStartInDemo
+		log.Printf("  Alignment offset: %.1fs (earliest kill=%.1fs, estimated rec start=demo t=%.1fs)",
+			alignmentOffset, earliestKill, estimatedRecordingStartInDemo)
+	}
 
 	// Build merged timeline
 	timeline := alignTimelines(parsed, &transcript, alignmentOffset)
