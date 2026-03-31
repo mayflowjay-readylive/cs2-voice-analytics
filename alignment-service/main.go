@@ -79,6 +79,7 @@ type RoundResult struct {
 	Team1Score           int     `json:"team1Score"`
 	Team2Score           int     `json:"team2Score"`
 	RoundDurationSeconds float64 `json:"roundDurationSeconds"`
+	RoundStartSeconds    float64 `json:"roundStartSeconds"`
 	Team1Side            string  `json:"team1Side"`
 	Team2Side            string  `json:"team2Side"`
 }
@@ -374,6 +375,55 @@ func findMatchingDemo(ctx context.Context, client *s3.Client, demoBucket string,
 
 	log.Printf("  ✅ Matched demo: %s (delta: %dms / %.1fs)", bestKey, bestDelta, float64(bestDelta)/1000.0)
 	return bestKey, nil
+}
+
+// ─── Extract demo creation timestamp from demo bucket ───────────────────────
+
+// findDemoTimestampMs searches the demo bucket for a demo matching the recording
+// start time and returns its creation timestamp (from the filename).
+// This is lightweight — it only lists objects, doesn't download anything.
+func findDemoTimestampMs(ctx context.Context, client *s3.Client, demoBucket string, recordingStartMs int64) (int64, error) {
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(demoBucket),
+	})
+
+	bestTs := int64(0)
+	bestDelta := int64(math.MaxInt64)
+	windowMs := int64(30 * 60 * 1000)
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("list demos: %w", err)
+		}
+		for _, obj := range page.Contents {
+			if !strings.HasSuffix(*obj.Key, ".dem") {
+				continue
+			}
+			base := strings.TrimSuffix(*obj.Key, ".dem")
+			parts := strings.Split(base, "_")
+			if len(parts) < 2 {
+				continue
+			}
+			ts, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			delta := ts - recordingStartMs
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta < bestDelta && delta < windowMs {
+				bestDelta = delta
+				bestTs = ts
+			}
+		}
+	}
+
+	if bestTs == 0 {
+		return 0, fmt.Errorf("no demo found within 30 minutes")
+	}
+	return bestTs, nil
 }
 
 // ─── Generate presigned URL for demo ─────────────────────────────────────────
@@ -691,29 +741,34 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 	}
 
 	// ── Compute alignment offset ──
-	// Recording starts when GSI fires "live" (≈ round 1 start).
-	// Demo time 0 is demo file start (during warmup, before round 1).
-	// We estimate how many demo-seconds elapsed before the recording started.
+	// Recording starts when GSI fires "live" ≈ round 1 freezetime end.
+	// We need to find what demo time corresponds to recording t=0.
+	//
+	// Priority:
+	// 1. EXACT: use RoundStartSeconds from demo parser (demo time of round 1 freeze end)
+	// 2. FALLBACK: estimate from first kill time minus ~50s
 	alignmentOffset := 0.0
-	if len(parsed.KillEvents) > 0 {
+
+	if len(parsed.Rounds) > 0 && parsed.Rounds[0].RoundStartSeconds > 0 {
+		// Exact: round 1 start time from demo parser = demo time when recording started
+		alignmentOffset = -parsed.Rounds[0].RoundStartSeconds
+		log.Printf("  Alignment offset: %.1fs (EXACT — round 1 starts at demo t=%.1fs)",
+			alignmentOffset, parsed.Rounds[0].RoundStartSeconds)
+	} else if len(parsed.KillEvents) > 0 {
+		// Fallback: estimate from first kill (for old parse_results without RoundStartSeconds)
 		earliestKill := parsed.KillEvents[0].TimeSeconds
 		for _, ke := range parsed.KillEvents {
 			if ke.TimeSeconds < earliestKill && ke.TimeSeconds > 0 {
 				earliestKill = ke.TimeSeconds
 			}
 		}
-		// First kill is typically 40-60s after round start (freeze + buy + play).
-		// Recording t=0 ≈ demo t=(earliestKill - 50).
 		estimatedRecordingStartInDemo := earliestKill - 50.0
 		if estimatedRecordingStartInDemo < 0 {
 			estimatedRecordingStartInDemo = 0
 		}
-		// gameTime = utt.TStart - alignmentOffset
-		// We want utt.TStart=0 → gameTime=estimatedRecordingStartInDemo
-		// So: alignmentOffset = -estimatedRecordingStartInDemo
 		alignmentOffset = -estimatedRecordingStartInDemo
-		log.Printf("  Alignment offset: %.1fs (earliest kill=%.1fs, estimated rec start=demo t=%.1fs)",
-			alignmentOffset, earliestKill, estimatedRecordingStartInDemo)
+		log.Printf("  Alignment offset: %.1fs (estimated — no RoundStartSeconds, first kill at %.1fs)",
+			alignmentOffset, earliestKill)
 	}
 
 	// Build merged timeline
