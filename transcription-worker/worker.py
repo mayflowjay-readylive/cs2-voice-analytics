@@ -4,7 +4,14 @@ Transcription Worker (Gemini)
 Polls S3 for sessions with status=pending_transcription.
 Decodes per-player Opus packets to WAV, uploads to Gemini Files API,
 transcribes in Danish, writes timestamped transcripts back to S3,
-then deletes audio files from R2 (retention policy).
+then deletes audio files from R2 ONLY after transcript.json is confirmed written.
+
+Resilience improvements:
+ - Audio retained until transcript.json is confirmed written to R2
+ - Partial transcript saved after every player (crash-safe resume)
+ - Per-player transcription progress tracked in meta.json
+ - Full Gemini diagnostics logged on empty/failed response
+ - Retry on empty Gemini response (up to MAX_GEMINI_RETRIES attempts)
 """
 
 import os
@@ -15,7 +22,7 @@ import struct
 import wave
 import tempfile
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import boto3
 import opuslib
@@ -32,15 +39,16 @@ S3_ENDPOINT   = os.environ.get("S3_ENDPOINT")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
 
-STALE_THRESHOLD_SECONDS = 900  # 15 minutes
-MAX_RETRIES = 3
+STALE_THRESHOLD_SECONDS = 900   # 15 minutes
+MAX_RETRIES             = 3     # stale-session retries
+MAX_GEMINI_RETRIES      = 3     # retries on empty Gemini response
 
 # WAV format constants for duration calculation
-WAV_SAMPLE_RATE = 48000
-WAV_CHANNELS = 2
-WAV_SAMPLE_WIDTH = 2  # 16-bit
-WAV_HEADER_SIZE = 44
-WAV_BYTES_PER_SECOND = WAV_SAMPLE_RATE * WAV_CHANNELS * WAV_SAMPLE_WIDTH
+WAV_SAMPLE_RATE       = 48000
+WAV_CHANNELS          = 2
+WAV_SAMPLE_WIDTH      = 2   # 16-bit
+WAV_HEADER_SIZE       = 44
+WAV_BYTES_PER_SECOND  = WAV_SAMPLE_RATE * WAV_CHANNELS * WAV_SAMPLE_WIDTH
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -68,10 +76,10 @@ class Utterance:
 def opus_to_wav(opus_bytes: bytes) -> bytes:
     """Decode length-prefixed raw Opus packets to WAV (48kHz stereo 16-bit)."""
     SAMPLE_RATE = 48000
-    CHANNELS = 2
-    FRAME_SIZE = 960  # 20ms at 48kHz
+    CHANNELS    = 2
+    FRAME_SIZE  = 960  # 20ms at 48kHz
 
-    decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+    decoder    = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
     pcm_chunks = []
 
     offset = 0
@@ -116,7 +124,6 @@ def get_wav_duration(wav_bytes: bytes) -> float:
 
 # ─── Gemini transcription ──────────────────────────────────────────────────
 
-# All known CS2 callouts and terms — used in prompt and cleanup pass
 CS2_CALLOUTS = [
     # Sites & areas
     "A site", "B site", "mid", "CT", "T side", "CT spawn", "T spawn",
@@ -144,8 +151,9 @@ CS2_CALLOUTS = [
     "going B", "going A", "pushing mid", "they're rushing",
 ]
 
+
 def build_transcription_prompt(map_name: str = None) -> str:
-    map_line = f"Map: {map_name}" if map_name else "Map: unknown (could be any CS2 map)"
+    map_line    = f"Map: {map_name}" if map_name else "Map: unknown (could be any CS2 map)"
     callout_list = ", ".join(f'"{c}"' for c in CS2_CALLOUTS)
     return f"""This is a voice recording from a CS2 (Counter-Strike 2) match.
 The player is speaking Danish, frequently mixing in English CS2 terms.
@@ -175,6 +183,7 @@ Return ONLY a JSON array with this exact schema, no preamble or markdown:
 If there is silence or no speech, return an empty array: []
 """
 
+# NOTE: {transcript_json} MUST be present — the transcript is injected below in cleanup_transcript()
 CLEANUP_PROMPT = """You are a transcript editor for CS2 voice recordings in Danish.
 The following transcript was auto-generated from a Danish CS2 voice recording.
 It may contain transcription errors that need fixing.
@@ -206,57 +215,67 @@ Rules — fix ALL of the following issues:
    - Do NOT change correct Danish words or grammar
    - Keep all timestamps (t_start, t_end) exactly as they are
 
+Transcript to correct:
+{transcript_json}
+
 Return ONLY the corrected JSON array in the exact same format as input, no preamble or markdown."""
 
 
 def scale_timestamps(raw_utterances: list[dict], wav_duration: float) -> list[dict]:
-    """Scale Gemini's compressed timestamps to match actual audio duration.
-
-    Gemini ignores silence frames in the audio and returns timestamps relative
-    to speech content only. For a 2500s audio file, Gemini might return
-    timestamps in the 0-42s range. This function detects the compression
-    and scales timestamps proportionally to the actual audio duration.
-
-    Args:
-        raw_utterances: List of utterance dicts from Gemini with t_start/t_end
-        wav_duration: Actual WAV audio duration in seconds
-
-    Returns:
-        Same utterances with timestamps scaled to match audio duration
-    """
+    """Scale Gemini's compressed timestamps to match actual audio duration."""
     if not raw_utterances or wav_duration <= 0:
         return raw_utterances
 
-    # Find the maximum timestamp Gemini returned
     max_t = 0.0
     for u in raw_utterances:
-        t_end = u.get("t_end", 0.0)
-        t_start = u.get("t_start", 0.0)
-        max_t = max(max_t, t_end, t_start)
+        max_t = max(max_t, u.get("t_end", 0.0), u.get("t_start", 0.0))
 
     if max_t <= 0:
         return raw_utterances
 
-    # Calculate scaling factor
     scale = wav_duration / max_t
-
-    # Only scale if timestamps are significantly compressed (>2x difference)
     if scale <= 2.0:
         log.info(f"  Timestamps OK (scale={scale:.1f}x, audio={wav_duration:.0f}s, gemini_max={max_t:.1f}s)")
         return raw_utterances
 
     log.info(f"  ⚡ Scaling timestamps by {scale:.1f}x (audio={wav_duration:.0f}s, gemini_max={max_t:.1f}s)")
-
     for u in raw_utterances:
         u["t_start"] = u.get("t_start", 0.0) * scale
-        u["t_end"] = u.get("t_end", 0.0) * scale
-
+        u["t_end"]   = u.get("t_end", 0.0) * scale
     return raw_utterances
 
 
+def _log_gemini_diagnostics(response, attempt: int, steam_id: str) -> None:
+    """Log all available Gemini response diagnostics when response is empty or failed."""
+    log.warning(f"  ⚠️  Gemini returned empty response for {steam_id} (attempt {attempt}/{MAX_GEMINI_RETRIES})")
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            c             = candidates[0]
+            finish_reason = getattr(c, "finish_reason", "UNKNOWN")
+            safety_ratings = getattr(c, "safety_ratings", [])
+            log.warning(f"      finish_reason  : {finish_reason}")
+            log.warning(f"      safety_ratings : {safety_ratings}")
+            content = getattr(c, "content", None)
+            if content:
+                log.warning(f"      content.parts  : {getattr(content, 'parts', None)}")
+        else:
+            log.warning(f"      candidates     : (none)")
+
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        if prompt_feedback:
+            log.warning(f"      prompt_feedback: {prompt_feedback}")
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            log.info(f"      usage_metadata : {usage}")
+    except Exception as diag_err:
+        log.warning(f"      (could not extract full diagnostics: {diag_err})")
+
+
 def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None) -> list[Utterance]:
-    """Upload WAV to Gemini Files API and transcribe."""
-    # Calculate audio duration BEFORE transcription (needed for timestamp scaling)
+    """Upload WAV to Gemini Files API and transcribe.
+    Retries up to MAX_GEMINI_RETRIES times on empty response."""
     wav_duration = get_wav_duration(wav_bytes)
     log.info(f"  Audio duration: {wav_duration:.1f}s ({wav_duration/60:.1f}min)")
 
@@ -271,7 +290,6 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
             config=types.UploadFileConfig(mime_type="audio/wav"),
         )
 
-        # Wait for file to be processed
         while audio_file.state.name == "PROCESSING":
             time.sleep(1)
             audio_file = client.files.get(name=audio_file.name)
@@ -279,48 +297,79 @@ def transcribe_with_gemini(wav_bytes: bytes, steam_id: str, map_name: str = None
         if audio_file.state.name == "FAILED":
             raise RuntimeError(f"Gemini file processing failed: {audio_file.state}")
 
-        prompt = build_transcription_prompt(map_name)
-        log.info(f"  Requesting transcription (gemini-2.5-pro)…")
-        response = client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=[prompt, audio_file],
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-            ),
-        )
+        prompt      = build_transcription_prompt(map_name)
+        last_error  = None
 
-        # Clean up uploaded file
+        for attempt in range(1, MAX_GEMINI_RETRIES + 1):
+            if attempt > 1:
+                wait = 15 * (2 ** (attempt - 2))  # 15s, 30s
+                log.warning(f"  Retrying transcription in {wait}s (attempt {attempt}/{MAX_GEMINI_RETRIES})…")
+                time.sleep(wait)
+
+            log.info(f"  Requesting transcription (gemini-2.5-pro, attempt {attempt}/{MAX_GEMINI_RETRIES})…")
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-pro",
+                    contents=[prompt, audio_file],
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                    ),
+                )
+            except Exception as api_err:
+                last_error = str(api_err)
+                log.error(f"  Gemini API call failed (attempt {attempt}): {api_err}")
+                continue
+
+            # ── Empty / None response ──────────────────────────────────────────
+            if not response.text or not response.text.strip():
+                _log_gemini_diagnostics(response, attempt, steam_id)
+                last_error = f"Empty response on attempt {attempt}"
+                continue
+
+            # ── Parse JSON ────────────────────────────────────────────────────
+            try:
+                text           = response.text.strip().replace("```json", "").replace("```", "").strip()
+                raw_utterances = json.loads(text)
+            except json.JSONDecodeError as parse_err:
+                log.error(f"  JSON parse failed (attempt {attempt}): {parse_err}")
+                log.error(f"  Raw response (first 500 chars): {response.text[:500]!r}")
+                last_error = f"JSON parse error: {parse_err}"
+                continue
+
+            log.info(f"  Raw transcription: {len(raw_utterances)} utterances")
+
+            # ── Scale + cleanup ───────────────────────────────────────────────
+            raw_utterances = scale_timestamps(raw_utterances, wav_duration)
+            raw_utterances = cleanup_transcript(raw_utterances)
+
+            # ── Delete Gemini file ────────────────────────────────────────────
+            try:
+                client.files.delete(name=audio_file.name)
+            except Exception:
+                pass
+
+            return [
+                Utterance(
+                    steam_id   = steam_id,
+                    t_start    = u.get("t_start", 0.0),
+                    t_end      = u.get("t_end", 0.0),
+                    text       = u.get("text", ""),
+                    confidence = u.get("confidence", 1.0),
+                )
+                for u in raw_utterances
+                if u.get("text", "").strip()
+            ]
+
+        # All retries exhausted — clean up Gemini file before raising
         try:
             client.files.delete(name=audio_file.name)
         except Exception:
             pass
 
-        text = response.text if response.text else None
-        if not text:
-            log.warning(f"  Gemini returned empty response for {steam_id}")
-            return []
-        text = text.strip().replace("```json", "").replace("```", "").strip()
-        raw_utterances = json.loads(text)
-        log.info(f"  Raw transcription: {len(raw_utterances)} utterances")
-
-        # Scale timestamps BEFORE cleanup (cleanup preserves timestamps)
-        raw_utterances = scale_timestamps(raw_utterances, wav_duration)
-
-        # Post-processing cleanup pass
-        raw_utterances = cleanup_transcript(raw_utterances)
-
-        return [
-            Utterance(
-                steam_id=steam_id,
-                t_start=u.get("t_start", 0.0),
-                t_end=u.get("t_end", 0.0),
-                text=u.get("text", ""),
-                confidence=u.get("confidence", 1.0),
-            )
-            for u in raw_utterances
-            if u.get("text", "").strip()
-        ]
+        raise RuntimeError(
+            f"Transcription failed after {MAX_GEMINI_RETRIES} attempts for {steam_id}. Last error: {last_error}"
+        )
 
     finally:
         os.unlink(tmp.name)
@@ -333,41 +382,45 @@ def cleanup_transcript(raw_utterances: list[dict]) -> list[dict]:
 
     callout_list = ", ".join(f'"{c}"' for c in CS2_CALLOUTS)
     prompt = CLEANUP_PROMPT.format(
-        callout_list=callout_list,
-        transcript_json=json.dumps(raw_utterances, ensure_ascii=False, indent=2),
+        callout_list   = callout_list,
+        transcript_json = json.dumps(raw_utterances, ensure_ascii=False, indent=2),
     )
 
-    log.info(f"  Running cleanup pass…")
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
-
-    if not response.text:
-        log.warning(f"  Cleanup pass returned empty response, using original")
-        return raw_utterances
-    text = response.text.strip().replace("```json", "").replace("```", "").strip()
+    log.info(f"  Running cleanup pass on {len(raw_utterances)} utterances…")
     try:
-        return json.loads(text)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+
+        if not response.text or not response.text.strip():
+            log.warning(f"  Cleanup pass returned empty response — keeping original")
+            return raw_utterances
+
+        text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        cleaned = json.loads(text)
+        log.info(f"  Cleanup: {len(raw_utterances)} → {len(cleaned)} utterances")
+        return cleaned
+
     except Exception as e:
-        log.warning(f"  Cleanup pass failed to parse, using original: {e}")
+        log.warning(f"  Cleanup pass failed ({e}) — keeping original transcript")
         return raw_utterances
 
 
 # ─── S3 helpers ─────────────────────────────────────────────────────────────
 
 def list_pending_sessions() -> list[str]:
-    pending = []
+    pending   = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="matches/", Delimiter="/"):
         for prefix in page.get("CommonPrefixes", []):
             match_prefix = prefix["Prefix"]
             try:
-                obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
+                obj  = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
                 meta = json.loads(obj["Body"].read())
                 if meta.get("status") == "pending_transcription":
                     pending.append(meta["matchId"])
@@ -383,12 +436,11 @@ def check_stale_sessions():
         for prefix in page.get("CommonPrefixes", []):
             match_prefix = prefix["Prefix"]
             try:
-                obj = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
+                obj  = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
                 meta = json.loads(obj["Body"].read())
                 if meta.get("status") != "transcribing":
                     continue
 
-                updated_at = None
                 if meta.get("statusUpdatedAt"):
                     updated_at = datetime.fromisoformat(meta["statusUpdatedAt"].replace("Z", "+00:00"))
                 else:
@@ -398,14 +450,19 @@ def check_stale_sessions():
                 if age.total_seconds() < STALE_THRESHOLD_SECONDS:
                     continue
 
-                match_id = meta["matchId"]
+                match_id    = meta["matchId"]
                 retry_count = meta.get("retryCount", 0)
 
                 if retry_count >= MAX_RETRIES:
                     log.warning(f"⛔ Session {match_id} stuck in 'transcribing' after {MAX_RETRIES} retries — marking as error")
-                    set_status(match_id, "error_transcription", {"error": f"Stuck in transcribing after {MAX_RETRIES} retries"})
+                    set_status(match_id, "error_transcription", {
+                        "error": f"Stuck in transcribing after {MAX_RETRIES} retries"
+                    })
                 else:
-                    log.warning(f"🔄 Session {match_id} stuck in 'transcribing' for {int(age.total_seconds())}s — resetting (retry {retry_count + 1}/{MAX_RETRIES})")
+                    log.warning(
+                        f"🔄 Session {match_id} stuck in 'transcribing' for {int(age.total_seconds())}s"
+                        f" — resetting (retry {retry_count + 1}/{MAX_RETRIES})"
+                    )
                     set_status(match_id, "pending_transcription", {"retryCount": retry_count + 1})
 
             except Exception:
@@ -418,7 +475,7 @@ def get_meta(match_id: str) -> dict:
 
 
 def set_status(match_id: str, status: str, extra: dict = None):
-    meta = get_meta(match_id)
+    meta          = get_meta(match_id)
     meta["status"] = status
     meta["statusUpdatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if extra:
@@ -431,77 +488,199 @@ def set_status(match_id: str, status: str, extra: dict = None):
     )
 
 
+def r2_object_exists(key: str) -> bool:
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def update_player_progress(match_id: str, steam_id: str, status: str,
+                           utterance_count: int = 0, error: str = None) -> None:
+    """Write per-player transcription progress into meta.json."""
+    try:
+        meta = get_meta(match_id)
+        if "transcriptionProgress" not in meta:
+            meta["transcriptionProgress"] = {}
+        entry = {
+            "status"    : status,
+            "utterances": utterance_count,
+            "updatedAt" : datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        if error:
+            entry["error"] = error
+        meta["transcriptionProgress"][steam_id] = entry
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"matches/{match_id}/meta.json",
+            Body=json.dumps(meta, indent=2),
+            ContentType="application/json",
+        )
+    except Exception as e:
+        log.warning(f"  Could not update player progress for {steam_id}: {e}")
+
+
 # ─── Main processing ────────────────────────────────────────────────────────
 
 def process_session(match_id: str):
     log.info(f"Processing match: {match_id}")
     set_status(match_id, "transcribing")
-    meta = get_meta(match_id)
-    all_utterances = []
+    meta     = get_meta(match_id)
+    map_name = meta.get("map")
 
+    # ── Resume from partial transcript if a previous run crashed ─────────────
+    partial_key           = f"matches/{match_id}/transcript_partial.json"
+    completed_steam_ids   : set[str] = set()
+    all_utterances        : list[dict] = []
+
+    if r2_object_exists(partial_key):
+        try:
+            obj     = s3.get_object(Bucket=S3_BUCKET, Key=partial_key)
+            partial = json.loads(obj["Body"].read())
+            all_utterances      = partial.get("utterances", [])
+            completed_steam_ids = set(partial.get("completedSteamIds", []))
+            log.info(
+                f"  📂 Resuming from partial transcript: "
+                f"{len(completed_steam_ids)}/{len(meta['players'])} players done, "
+                f"{len(all_utterances)} utterances so far"
+            )
+        except Exception as e:
+            log.warning(f"  Could not load partial transcript ({e}) — starting fresh")
+
+    # ── Track audio keys that are safe to delete after transcript is written ──
+    audio_keys_to_delete : list[str] = []
+
+    # ── Per-player transcription ──────────────────────────────────────────────
     for player in meta["players"]:
         steam_id  = player["steamId"]
         audio_key = player["audioKey"]
-        transcribed_successfully = False
+
+        # Already done in a previous run — still queue audio for deletion
+        if steam_id in completed_steam_ids:
+            log.info(f"  ✅ {steam_id} already transcribed — skipping")
+            audio_keys_to_delete.append(audio_key)
+            continue
+
+        log.info(f"  Downloading audio for {steam_id} ({audio_key})…")
+        update_player_progress(match_id, steam_id, "transcribing")
 
         try:
-            log.info(f"  Downloading audio for {steam_id} ({audio_key})…")
             audio_obj   = s3.get_object(Bucket=S3_BUCKET, Key=audio_key)
             audio_bytes = audio_obj["Body"].read()
             log.info(f"  Audio size: {len(audio_bytes) / 1024:.1f} KB")
-
-            if len(audio_bytes) < 1024:
-                log.info(f"  Skipping {steam_id}: audio too short")
-                transcribed_successfully = True
-                continue
-
-            log.info(f"  Decoding Opus packets to WAV…")
-            wav_bytes = opus_to_wav(audio_bytes)
-            if not wav_bytes:
-                log.info(f"  Skipping {steam_id}: no decodable audio")
-                transcribed_successfully = True
-                continue
-            log.info(f"  WAV size: {len(wav_bytes) / 1024:.1f} KB")
-
-            utterances = transcribe_with_gemini(wav_bytes, steam_id)
-            log.info(f"  → {len(utterances)} utterances for {steam_id}")
-            all_utterances.extend(utterances)
-            transcribed_successfully = True
-
         except Exception as e:
-            log.error(f"  Failed to transcribe {steam_id}: {e}")
+            log.error(f"  Failed to download audio for {steam_id}: {e}")
+            update_player_progress(match_id, steam_id, "error_download", error=str(e))
+            # Do NOT delete — audio may still be intact for a manual retry
+            continue
 
-        if transcribed_successfully:
-            try:
-                s3.delete_object(Bucket=S3_BUCKET, Key=audio_key)
-                log.info(f"  🗑️  Deleted audio: {audio_key}")
-            except Exception as e:
-                log.warning(f"  Failed to delete {audio_key}: {e}")
+        if len(audio_bytes) < 1024:
+            log.info(f"  Skipping {steam_id}: audio too short ({len(audio_bytes)} bytes)")
+            update_player_progress(match_id, steam_id, "skipped_too_short")
+            audio_keys_to_delete.append(audio_key)
+            completed_steam_ids.add(steam_id)
+            continue
 
-    all_utterances.sort(key=lambda u: u.t_start)
+        log.info(f"  Decoding Opus packets to WAV…")
+        try:
+            wav_bytes = opus_to_wav(audio_bytes)
+        except Exception as e:
+            log.error(f"  Opus decode failed for {steam_id}: {e}")
+            update_player_progress(match_id, steam_id, "error_decode", error=str(e))
+            continue
 
+        if not wav_bytes:
+            log.info(f"  Skipping {steam_id}: no decodable audio")
+            update_player_progress(match_id, steam_id, "skipped_no_audio")
+            audio_keys_to_delete.append(audio_key)
+            completed_steam_ids.add(steam_id)
+            continue
+
+        log.info(f"  WAV size: {len(wav_bytes) / 1024:.1f} KB")
+
+        try:
+            utterances = transcribe_with_gemini(wav_bytes, steam_id, map_name)
+            log.info(f"  → {len(utterances)} utterances for {steam_id}")
+        except Exception as e:
+            log.error(f"  Transcription failed for {steam_id}: {e}")
+            update_player_progress(match_id, steam_id, "error_transcription", error=str(e))
+            # Do NOT delete audio on transcription failure — keep for debugging
+            continue
+
+        # ── Player succeeded ──────────────────────────────────────────────────
+        all_utterances.extend([asdict(u) for u in utterances])
+        completed_steam_ids.add(steam_id)
+        audio_keys_to_delete.append(audio_key)
+
+        update_player_progress(match_id, steam_id, "done", utterance_count=len(utterances))
+
+        # ── Save partial transcript after every player (crash safety) ─────────
+        try:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=partial_key,
+                Body=json.dumps({
+                    "matchId"           : match_id,
+                    "completedSteamIds" : list(completed_steam_ids),
+                    "utterances"        : all_utterances,
+                    "savedAt"           : datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }, indent=2),
+                ContentType="application/json",
+            )
+            log.info(f"  💾 Partial transcript saved ({len(completed_steam_ids)}/{len(meta['players'])} players)")
+        except Exception as e:
+            log.warning(f"  Could not save partial transcript: {e}")
+
+    # ── Sort utterances by time ───────────────────────────────────────────────
+    all_utterances.sort(key=lambda u: u.get("t_start", 0))
+
+    # ── Write final transcript.json ───────────────────────────────────────────
+    transcript_key = f"matches/{match_id}/transcript.json"
     transcript = {
-        "matchId":          match_id,
-        "recordingStartMs": meta["recordingStartMs"],
-        "utterances":       [asdict(u) for u in all_utterances],
-        "playerCount":      len(meta["players"]),
-        "totalUtterances":  len(all_utterances),
-        "provider":         "gemini",
+        "matchId"          : match_id,
+        "recordingStartMs" : meta.get("recordingStartMs"),
+        "utterances"       : all_utterances,
+        "playerCount"      : len(meta["players"]),
+        "completedPlayers" : len(completed_steam_ids),
+        "totalUtterances"  : len(all_utterances),
+        "provider"         : "gemini",
     }
 
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=f"matches/{match_id}/transcript.json",
-        Body=json.dumps(transcript, indent=2),
-        ContentType="application/json",
-    )
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=transcript_key,
+            Body=json.dumps(transcript, indent=2),
+            ContentType="application/json",
+        )
+        log.info(f"  ✅ transcript.json written: {len(all_utterances)} utterances from {len(completed_steam_ids)}/{len(meta['players'])} players")
+    except Exception as e:
+        log.error(f"  ❌ Failed to write transcript.json: {e}")
+        set_status(match_id, "error_transcription", {"error": f"Could not write transcript.json: {e}"})
+        return
 
+    # ── ONLY delete audio AFTER transcript.json is confirmed written ──────────
+    for audio_key in audio_keys_to_delete:
+        try:
+            s3.delete_object(Bucket=S3_BUCKET, Key=audio_key)
+            log.info(f"  🗑️  Deleted audio: {audio_key}")
+        except Exception as e:
+            log.warning(f"  Failed to delete audio {audio_key}: {e}")
+
+    # ── Clean up partial transcript now that final is written ─────────────────
+    try:
+        s3.delete_object(Bucket=S3_BUCKET, Key=partial_key)
+    except Exception:
+        pass
+
+    # ── Advance to alignment ──────────────────────────────────────────────────
     set_status(match_id, "pending_alignment", {
-        "transcriptKey": f"matches/{match_id}/transcript.json",
-        "transcribedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "transcriptKey": transcript_key,
+        "transcribedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
 
-    log.info(f"✅ Transcription complete for {match_id}: {len(all_utterances)} utterances")
+    log.info(f"✅ Transcription complete for {match_id}: {len(all_utterances)} utterances from {len(completed_steam_ids)}/{len(meta['players'])} players")
 
 
 def main():
@@ -519,7 +698,7 @@ def main():
                     except Exception as e:
                         log.error(f"Error processing {match_id}: {e}")
                         try:
-                            set_status(match_id, "error_transcription")
+                            set_status(match_id, "error_transcription", {"error": str(e)})
                         except Exception:
                             pass
             else:
