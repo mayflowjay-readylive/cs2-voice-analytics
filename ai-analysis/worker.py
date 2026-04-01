@@ -161,7 +161,8 @@ def build_name_reference(player_names, player_info):
         name = info.get("name", "unknown")
         real_name = info.get("realName", "")
         nicknames = info.get("nicknames", [])
-        parts = [f'{alias} = "{name}"']
+        team = info.get("team", 0)
+        parts = [f'{alias} = "{name}" (team {team})']
         if real_name: parts.append(f"real name: {real_name}")
         if nicknames: parts.append(f"may be called: {', '.join(nicknames)}")
         if real_name or nicknames:
@@ -171,13 +172,62 @@ def build_name_reference(player_names, player_info):
     return "\n".join(lines)
 
 
+# ─── Team roster for a specific round ────────────────────────────────────────
+
+def build_round_team_roster(round_, player_names, player_info):
+    """Build a team roster string showing which players are CT and which are T for this round."""
+    team1_side = round_.get("team1Side", "")
+    team2_side = round_.get("team2Side", "")
+
+    if not team1_side and not team2_side:
+        return ""
+
+    ct_players = []
+    t_players = []
+
+    for sid, alias in player_names.items():
+        info = player_info.get(sid, {})
+        team_num = info.get("team", 0)
+        gamertag = info.get("name", alias)
+        label = f"{alias} ({gamertag})"
+
+        if team_num == 1:
+            if team1_side.upper() == "CT":
+                ct_players.append(label)
+            else:
+                t_players.append(label)
+        elif team_num == 2:
+            if team2_side.upper() == "CT":
+                ct_players.append(label)
+            else:
+                t_players.append(label)
+
+    lines = []
+    if ct_players:
+        lines.append(f"  CT: {', '.join(ct_players)}")
+    if t_players:
+        lines.append(f"  T:  {', '.join(t_players)}")
+
+    if lines:
+        return "TEAMS THIS ROUND:\n" + "\n".join(lines)
+    return ""
+
+
 # ─── Prompt builders ──────────────────────────────────────────────────────────
 
-def render_round_for_prompt(round_, player_names):
+def render_round_for_prompt(round_, player_names, player_info):
     round_num = round_.get("roundNum", "?")
     win_reason = round_.get("winReason", "")
     winner = round_.get("winner", "")
+
     lines = [f"--- Round {round_num} (winner: team {winner}, reason: {win_reason}) ---"]
+
+    # Add team roster so Gemini knows who is CT and who is T
+    roster = build_round_team_roster(round_, player_names, player_info)
+    if roster:
+        lines.append(roster)
+        lines.append("")
+
     for ev in (round_.get("events") or []):
         t = ev.get("t", 0)
         pid = player_names.get(ev.get("steamId", ""), ev.get("steamId", "?"))
@@ -189,7 +239,16 @@ def render_round_for_prompt(round_, player_names):
             hs = " (HS)" if ev.get("headshot") else ""
             trade = " [TRADE]" if ev.get("tradeKill") else ""
             first = " [FIRST KILL]" if ev.get("firstKill") else ""
-            lines.append(f"  [{t:6.1f}s] KILL {pid} killed {victim} ({ev.get('weapon', '')}){hs}{trade}{first}")
+            # Include side info so Gemini can distinguish enemy kills from team kills
+            killer_side = ev.get("killerSide", "")
+            victim_side = ev.get("victimSide", "")
+            if killer_side and victim_side:
+                if killer_side == victim_side:
+                    lines.append(f"  [{t:6.1f}s] TEAMKILL {pid} ({killer_side}) killed teammate {victim} ({victim_side}) ({ev.get('weapon', '')}){hs}")
+                else:
+                    lines.append(f"  [{t:6.1f}s] KILL {pid} ({killer_side}) killed {victim} ({victim_side}) ({ev.get('weapon', '')}){hs}{trade}{first}")
+            else:
+                lines.append(f"  [{t:6.1f}s] KILL {pid} killed {victim} ({ev.get('weapon', '')}){hs}{trade}{first}")
         elif kind == "planted":
             lines.append(f"  [      ] BOMB {pid} planted on {ev.get('site', '?')}")
         elif kind == "defused":
@@ -201,9 +260,13 @@ def render_round_for_prompt(round_, player_names):
 
 def build_round_system_prompt(name_reference):
     return f"""You are an expert CS2 analyst specializing in team communication analysis.
-You will receive a CS2 round timeline combining voice communications (VOICE) with in-game events (KILL, BOMB, DEFUSE, EXPLODE).
+You will receive a CS2 round timeline combining voice communications (VOICE) with in-game events (KILL, TEAMKILL, BOMB, DEFUSE, EXPLODE).
 Players are identified by aliases like Player_1, Player_2, etc.
 Voice comms may be in Danish mixed with English CS2 terms — analyse based on meaning, not language.
+
+Each round includes a TEAMS THIS ROUND section showing which players are on CT and which are on T side. Use this to understand team dynamics — players on the same side are teammates.
+
+KILL events show the side of both killer and victim (CT/T). A kill where both are on the same side is explicitly marked as TEAMKILL.
 
 PLAYER IDENTITY REFERENCE:
 {name_reference}
@@ -294,7 +357,7 @@ def gemini_json(prompt):
     text = response.text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(text)
 
-def analyse_round(round_, player_names, round_system_prompt):
+def analyse_round(round_, player_names, player_info, round_system_prompt):
     events = round_.get("events") or []
     has_comms = any(ev.get("type") == "utterance" for ev in events)
     if not has_comms:
@@ -304,7 +367,7 @@ def analyse_round(round_, player_names, round_system_prompt):
             "key_callouts": [], "info_quality_scores": {}, "silent_players": [],
             "summary": "No voice communications this round.",
         }
-    round_text = render_round_for_prompt(round_, player_names)
+    round_text = render_round_for_prompt(round_, player_names, player_info)
     prompt = round_system_prompt + "\n\n" + round_text
     return gemini_json(prompt)
 
@@ -352,7 +415,7 @@ def process_session(match_id, profiles):
     for i, round_ in enumerate(rounds):
         log.info(f"  Analysing round {round_.get('roundNum')} ({i+1}/{len(rounds)})...")
         try:
-            analysis = analyse_round(round_, player_names, round_system_prompt)
+            analysis = analyse_round(round_, player_names, player_info, round_system_prompt)
             analysis["round_num"] = round_.get("roundNum")
             round_analyses.append(analysis)
         except Exception as e:
