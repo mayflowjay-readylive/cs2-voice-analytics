@@ -84,7 +84,7 @@ export class SessionRecorder {
           if (!existing.audioStream.destroyed) {
             return;
           }
-          console.log(`🔄 ${userId} reconnected — re-subscribing (appending to existing file)`);
+          console.log(`🔄 ${userId} stream was destroyed — re-subscribing (appending to existing file)`);
           try { existing.writeStream.end(); } catch {}
           const existingFilePath = existing.filePath;
           const existingSteamId = existing.steamId;
@@ -166,8 +166,17 @@ export class SessionRecorder {
       lastPacketTime = now;
     });
 
+    // CRITICAL FIX: Destroy the stream on error so that the reconnection
+    // logic in speaking.on("start") can detect it and resubscribe.
+    // Without this, DAVE re-keying errors leave a zombie stream that
+    // blocks reconnection — the player silently drops out for the rest
+    // of the match.
     audioStream.on("error", (err) => {
-      console.warn(`⚠️ Audio stream error for ${userId} (suppressed): ${err.message}`);
+      console.warn(`⚠️ Audio stream error for ${userId}: ${err.message}`);
+      if (!audioStream.destroyed) {
+        console.log(`💀 Destroying zombie stream for ${userId} — will resubscribe on next speak event`);
+        audioStream.destroy();
+      }
     });
 
     this.receivers.set(userId, { filePath, audioStream, writeStream, steamId, lastPacketTime });
