@@ -136,7 +136,8 @@ type TimelineEvent struct {
 	Headshot   bool    `json:"headshot,omitempty"`
 	FirstKill  bool    `json:"firstKill,omitempty"`
 	TradeKill  bool    `json:"tradeKill,omitempty"`
-	Side       string  `json:"side,omitempty"`
+	KillerSide string  `json:"killerSide,omitempty"`
+	VictimSide string  `json:"victimSide,omitempty"`
 	Confidence float64 `json:"confidence,omitempty"`
 }
 
@@ -144,6 +145,8 @@ type MergedRound struct {
 	RoundNum  int             `json:"roundNum"`
 	WinReason string          `json:"winReason,omitempty"`
 	Winner    int             `json:"winner,omitempty"`
+	Team1Side string          `json:"team1Side,omitempty"`
+	Team2Side string          `json:"team2Side,omitempty"`
 	Events    []TimelineEvent `json:"events"`
 }
 
@@ -236,6 +239,20 @@ func setStatus(ctx context.Context, client *s3.Client, bucket, matchID, status s
 	for k, v := range extra {
 		rawMeta[k] = v
 	}
+	return putJSON(ctx, client, bucket, prefix+"/meta.json", rawMeta)
+}
+
+// setStatusPreserveTimestamp sets the status WITHOUT updating statusUpdatedAt.
+// Used when the alignment service sets back to pending_alignment while waiting
+// for voice-link data, so the patience timer keeps tracking cumulative time.
+func setStatusPreserveTimestamp(ctx context.Context, client *s3.Client, bucket, matchID, status string) error {
+	prefix := "matches/" + matchID
+	var rawMeta map[string]interface{}
+	if err := getJSON(ctx, client, bucket, prefix+"/meta.json", &rawMeta); err != nil {
+		return err
+	}
+	rawMeta["status"] = status
+	// Intentionally NOT updating statusUpdatedAt
 	return putJSON(ctx, client, bucket, prefix+"/meta.json", rawMeta)
 }
 
@@ -547,15 +564,16 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 			continue
 		}
 		roundEvents[ke.RoundNumber] = append(roundEvents[ke.RoundNumber], TimelineEvent{
-			T:         ke.TimeSeconds,
-			Kind:      "kill",
-			SteamID:   ke.KillerSteamID,
-			Victim:    ke.VictimSteamID,
-			Weapon:    ke.Weapon,
-			Headshot:  ke.IsHeadshot,
-			FirstKill: ke.IsFirstKill,
-			TradeKill: ke.IsTradeKill,
-			Side:      ke.KillerSide,
+			T:          ke.TimeSeconds,
+			Kind:       "kill",
+			SteamID:    ke.KillerSteamID,
+			Victim:     ke.VictimSteamID,
+			Weapon:     ke.Weapon,
+			Headshot:   ke.IsHeadshot,
+			FirstKill:  ke.IsFirstKill,
+			TradeKill:  ke.IsTradeKill,
+			KillerSide: ke.KillerSide,
+			VictimSide: ke.VictimSide,
 		})
 	}
 
@@ -634,6 +652,8 @@ func alignTimelines(parsed *ParseResult, transcript *TranscriptData, alignmentOf
 			rr := parsed.Rounds[rn-1]
 			mr.WinReason = rr.WinReason
 			mr.Winner = rr.WinnerTeam
+			mr.Team1Side = rr.Team1Side
+			mr.Team2Side = rr.Team2Side
 		}
 
 		merged.Rounds = append(merged.Rounds, mr)
@@ -654,10 +674,15 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 		return fmt.Errorf("load meta: %w", err)
 	}
 
-	// Calculate how long this session has been pending alignment
-	// (uses statusUpdatedAt — when transcription finished — not startedAt)
+	// Calculate how long this session has been pending alignment.
+	// Uses alignmentFirstAttempt if set (persists across retries), otherwise
+	// falls back to statusUpdatedAt (when transcription finished).
 	pendingAge := time.Duration(0)
-	if ts, ok := rawMeta["statusUpdatedAt"].(string); ok && ts != "" {
+	if ts, ok := rawMeta["alignmentFirstAttempt"].(string); ok && ts != "" {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			pendingAge = time.Since(t)
+		}
+	} else if ts, ok := rawMeta["statusUpdatedAt"].(string); ok && ts != "" {
 		if t, err := time.Parse(time.RFC3339, ts); err == nil {
 			pendingAge = time.Since(t)
 		}
@@ -711,8 +736,22 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 					pendingAge.Round(time.Second), waitRemaining.Round(time.Second))
 				log.Printf("     The voice-link-worker may still rename this session and upload parse_result.json.")
 
-				// Set back to pending_alignment so we try again on next poll
-				setStatus(ctx, client, voiceBucket, matchID, "pending_alignment", nil)
+				// Set back to pending_alignment WITHOUT updating statusUpdatedAt
+				// so the patience timer keeps tracking cumulative time.
+				// Also stamp alignmentFirstAttempt on the first try so we have a
+				// stable reference point that survives across polls.
+				if _, ok := rawMeta["alignmentFirstAttempt"]; !ok {
+					// First attempt — record the timestamp
+					var metaForUpdate map[string]interface{}
+					if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &metaForUpdate); err == nil {
+						metaForUpdate["status"] = "pending_alignment"
+						metaForUpdate["alignmentFirstAttempt"] = time.Now().UTC().Format(time.RFC3339)
+						putJSON(ctx, client, voiceBucket, prefix+"/meta.json", metaForUpdate)
+					}
+				} else {
+					// Subsequent attempts — preserve timestamp
+					setStatusPreserveTimestamp(ctx, client, voiceBucket, matchID, "pending_alignment")
+				}
 				return errNotReadyYet
 			}
 
@@ -779,17 +818,30 @@ func processSession(ctx context.Context, client *s3.Client, voiceBucket, demoBuc
 		return fmt.Errorf("upload timeline: %w", err)
 	}
 
-	// Update status
+	// Update status — clean up alignmentFirstAttempt since we're done
 	demoSource := "parse_result.json"
 	if _, ok := rawMeta["demoKey"]; ok {
 		demoSource = "demo_bucket"
 	}
-	if err := setStatus(ctx, client, voiceBucket, matchID, "pending_analysis", map[string]interface{}{
+	extras := map[string]interface{}{
 		"timelineKey": prefix + "/timeline_merged.json",
 		"mapName":     parsed.MapName,
 		"demoSource":  demoSource,
-	}); err != nil {
-		return fmt.Errorf("update meta: %w", err)
+	}
+	// Remove alignmentFirstAttempt since alignment is complete
+	// (setStatus will write the full meta, so we need to remove it from rawMeta)
+	metaForFinal := make(map[string]interface{})
+	if err := getJSON(ctx, client, voiceBucket, prefix+"/meta.json", &metaForFinal); err == nil {
+		delete(metaForFinal, "alignmentFirstAttempt")
+		metaForFinal["status"] = "pending_analysis"
+		metaForFinal["statusUpdatedAt"] = time.Now().UTC().Format(time.RFC3339)
+		for k, v := range extras {
+			metaForFinal[k] = v
+		}
+		putJSON(ctx, client, voiceBucket, prefix+"/meta.json", metaForFinal)
+	} else {
+		// Fallback to normal setStatus
+		setStatus(ctx, client, voiceBucket, matchID, "pending_analysis", extras)
 	}
 
 	totalEvents := 0
