@@ -64,13 +64,6 @@ s3 = boto3.client(
     region_name=os.environ.get("AWS_REGION", "auto"),
 )
 
-# ─── In-memory blacklist ─────────────────────────────────────────────────────
-# Sessions that have permanently failed (all audio missing) are added here so
-# that R2 eventual consistency cannot cause them to be re-queued even if a
-# stale read returns the old pending_transcription status.
-
-_blocked_sessions: set[str] = set()
-
 # ─── Data types ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -503,7 +496,7 @@ def list_pending_sessions() -> list[str]:
                 status   = meta.get("status", "")
 
                 # Hard block: never re-queue sessions marked as permanently unprocessable
-                if meta.get("blocked") or match_id in _blocked_sessions:
+                if meta.get("blocked"):
                     log.debug(f"  blocked session skipped: {match_id}")
                     continue
 
@@ -764,10 +757,21 @@ def process_session(match_id: str):
         msg = f"All {len(meta['players'])} players failed — no audio could be transcribed"
         log.error(f"❌ {match_id}: {msg}")
         append_error_log(match_id, "all_players_failed", msg)
-        # Write blocked=true to permanently prevent re-queuing, regardless of status resets
-        set_status(match_id, "error_transcription", {"error": msg, "blocked": True})
-        _blocked_sessions.add(match_id)
-        log.error(f"  🚫 Session {match_id} marked as blocked — will never be re-queued")
+
+        # Only permanently block if ALL failures are error_download (audio missing).
+        # error_transcription failures (API errors etc.) are retriable.
+        progress = meta.get("transcriptionProgress", {})
+        all_download_errors = all(
+            v.get("status") == "error_download"
+            for v in progress.values()
+        ) if progress else False
+
+        if all_download_errors:
+            set_status(match_id, "error_transcription", {"error": msg, "blocked": True})
+            log.error(f"  🚫 Session {match_id} permanently blocked — all audio missing")
+        else:
+            set_status(match_id, "error_transcription", {"error": msg})
+            log.error(f"  ❌ Session {match_id} marked error_transcription — retriable")
         send_discord_alert(
             title=f"❌ Transcription failed — no audio transcribed",
             description=(
