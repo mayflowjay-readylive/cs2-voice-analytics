@@ -500,7 +500,14 @@ def list_pending_sessions() -> list[str]:
 
 
 def check_stale_sessions():
-    """Find sessions stuck in 'transcribing' and reset or error them."""
+    """Find sessions stuck in 'transcribing' with NO progress for >15 minutes.
+
+    KEY FIX: We use `lastProgressAt` (updated after every player completes)
+    rather than `statusUpdatedAt` (set once when transcribing starts).
+    This prevents the stale checker from killing sessions that are actively
+    transcribing long audio files — which previously caused concurrent runs
+    that deleted audio mid-transcription.
+    """
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="matches/", Delimiter="/"):
         for prefix in page.get("CommonPrefixes", []):
@@ -511,12 +518,16 @@ def check_stale_sessions():
                 if meta.get("status") != "transcribing":
                     continue
 
-                if meta.get("statusUpdatedAt"):
-                    updated_at = datetime.fromisoformat(meta["statusUpdatedAt"].replace("Z", "+00:00"))
+                # Use lastProgressAt if available — it's updated after every player
+                # completes, so an active session will never appear stale here.
+                # Fall back to statusUpdatedAt for sessions started before this fix.
+                progress_at_str = meta.get("lastProgressAt") or meta.get("statusUpdatedAt")
+                if progress_at_str:
+                    progress_at = datetime.fromisoformat(progress_at_str.replace("Z", "+00:00"))
                 else:
-                    updated_at = obj["LastModified"]
+                    progress_at = obj["LastModified"]
 
-                age = datetime.now(timezone.utc) - updated_at
+                age = datetime.now(timezone.utc) - progress_at
                 if age.total_seconds() < STALE_THRESHOLD_SECONDS:
                     continue
 
@@ -524,7 +535,7 @@ def check_stale_sessions():
                 retry_count = meta.get("retryCount", 0)
 
                 if retry_count >= MAX_RETRIES:
-                    msg = f"Stuck in transcribing after {MAX_RETRIES} retries"
+                    msg = f"No progress for {int(age.total_seconds())}s after {MAX_RETRIES} retries"
                     log.warning(f"⛔ Session {match_id}: {msg}")
                     set_status(match_id, "error_transcription", {"error": msg})
                     append_error_log(match_id, "stale_session", msg)
@@ -532,15 +543,14 @@ def check_stale_sessions():
                         title=f"⛔ Transcription permanently failed",
                         description=(
                             f"**Match:** `{match_id}`\n"
-                            f"**Reason:** Stuck in `transcribing` after {MAX_RETRIES} retries\n"
-                            f"**Age:** {int(age.total_seconds() / 60)} minutes\n\n"
+                            f"**Reason:** {msg}\n\n"
                             f"Use the retry button in the app or check `errors.json` in R2."
                         ),
                         color=0xFF0000,
                     )
                 else:
                     log.warning(
-                        f"🔄 Session {match_id} stuck for {int(age.total_seconds())}s"
+                        f"🔄 Session {match_id} — no progress for {int(age.total_seconds())}s"
                         f" — resetting (retry {retry_count + 1}/{MAX_RETRIES})"
                     )
                     set_status(match_id, "pending_transcription", {"retryCount": retry_count + 1})
@@ -578,7 +588,11 @@ def r2_object_exists(key: str) -> bool:
 
 def update_player_progress(match_id: str, steam_id: str, status: str,
                            utterance_count: int = 0, error: str = None) -> None:
-    """Write per-player transcription progress into meta.json."""
+    """Write per-player transcription progress into meta.json.
+
+    Also updates lastProgressAt so the stale session checker knows this
+    session is alive and should not be reset.
+    """
     try:
         meta = get_meta(match_id)
         if "transcriptionProgress" not in meta:
@@ -591,6 +605,8 @@ def update_player_progress(match_id: str, steam_id: str, status: str,
         if error:
             entry["error"] = error
         meta["transcriptionProgress"][steam_id] = entry
+        # Keep lastProgressAt current so stale checker never fires on active sessions
+        meta["lastProgressAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=f"matches/{match_id}/meta.json",
@@ -720,7 +736,28 @@ def process_session(match_id: str):
         except Exception as e:
             log.warning(f"  Could not save partial transcript: {e}")
 
-    # ── Send Discord alert if any players failed ──────────────────────────────
+    # ── KEY FIX: If ALL players failed, don't write empty transcript and advance.
+    # Mark as error_transcription so the session is visible as failed in the app
+    # and can be retried once the underlying issue (missing audio, API errors) is resolved.
+    if len(completed_steam_ids) == 0:
+        msg = f"All {len(meta['players'])} players failed — no audio could be transcribed"
+        log.error(f"❌ {match_id}: {msg}")
+        append_error_log(match_id, "all_players_failed", msg)
+        set_status(match_id, "error_transcription", {"error": msg})
+        send_discord_alert(
+            title=f"❌ Transcription failed — no audio transcribed",
+            description=(
+                f"**Match:** `{match_id}`\n"
+                f"**Map:** {meta.get('map', 'unknown')}\n"
+                f"**Failed players:** {len(meta['players'])}/{len(meta['players'])}\n\n"
+                + "\n".join(f"- {e}" for e in player_errors)
+                + "\n\nCheck `errors.json` in R2 for full details."
+            ),
+            color=0xFF0000,
+        )
+        return
+
+    # ── Send Discord alert if any (but not all) players failed ────────────────
     if player_errors:
         map_label = meta.get("map", "unknown map")
         send_discord_alert(
