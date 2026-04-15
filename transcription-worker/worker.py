@@ -490,10 +490,19 @@ def list_pending_sessions() -> list[str]:
         for prefix in page.get("CommonPrefixes", []):
             match_prefix = prefix["Prefix"]
             try:
-                obj  = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
-                meta = json.loads(obj["Body"].read())
-                if meta.get("status") == "pending_transcription":
-                    pending.append(meta["matchId"])
+                obj      = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
+                meta     = json.loads(obj["Body"].read())
+                match_id = meta.get("matchId", "")
+                status   = meta.get("status", "")
+
+                # Hard block: never re-queue sessions marked as permanently unprocessable
+                if meta.get("blocked"):
+                    log.debug(f"  blocked session skipped: {match_id}")
+                    continue
+
+                if status == "pending_transcription":
+                    log.info(f"  queuing: {match_id}")
+                    pending.append(match_id)
             except Exception:
                 pass
     return pending
@@ -565,17 +574,22 @@ def get_meta(match_id: str) -> dict:
 
 
 def set_status(match_id: str, status: str, extra: dict = None):
-    meta           = get_meta(match_id)
-    meta["status"] = status
-    meta["statusUpdatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if extra:
-        meta.update(extra)
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=f"matches/{match_id}/meta.json",
-        Body=json.dumps(meta, indent=2),
-        ContentType="application/json",
-    )
+    try:
+        meta           = get_meta(match_id)
+        meta["status"] = status
+        meta["statusUpdatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if extra:
+            meta.update(extra)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"matches/{match_id}/meta.json",
+            Body=json.dumps(meta, indent=2),
+            ContentType="application/json",
+        )
+        log.info(f"  ✍️  Status set: {match_id} → {status}")
+    except Exception as e:
+        log.error(f"  ❌ set_status FAILED for {match_id} → {status}: {e}")
+        raise
 
 
 def r2_object_exists(key: str) -> bool:
@@ -743,7 +757,9 @@ def process_session(match_id: str):
         msg = f"All {len(meta['players'])} players failed — no audio could be transcribed"
         log.error(f"❌ {match_id}: {msg}")
         append_error_log(match_id, "all_players_failed", msg)
-        set_status(match_id, "error_transcription", {"error": msg})
+        # Write blocked=true to permanently prevent re-queuing, regardless of status resets
+        set_status(match_id, "error_transcription", {"error": msg, "blocked": True})
+        log.error(f"  🚫 Session {match_id} marked as blocked — will never be re-queued")
         send_discord_alert(
             title=f"❌ Transcription failed — no audio transcribed",
             description=(
