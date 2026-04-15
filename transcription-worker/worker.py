@@ -867,9 +867,12 @@ def main():
     log.info("🎙️ Transcription worker started (Gemini)")
     while True:
         try:
+            log.info("── poll start ──")
             check_stale_sessions()
+            log.info("── stale check done ──")
 
             pending = list_pending_sessions()
+            log.info(f"── list done, found {len(pending)} pending ──")
             if pending:
                 log.info(f"Found {len(pending)} pending sessions: {pending}")
                 for match_id in pending:
@@ -901,6 +904,7 @@ def main():
                 log.info("No pending sessions, sleeping…")
         except Exception as e:
             log.error(f"Worker loop error: {e}", exc_info=True)
+        log.info(f"── sleeping {POLL_INTERVAL}s ──")
         time.sleep(POLL_INTERVAL)
 
 
