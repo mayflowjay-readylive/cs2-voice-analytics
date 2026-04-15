@@ -2,9 +2,13 @@ import "dotenv/config";
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from "discord.js";
 import { joinVoiceChannel, VoiceConnectionStatus, entersState, getVoiceConnection } from "@discordjs/voice";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import { SessionRecorder } from "./recorder.js";
 import { uploadSession } from "./uploader.js";
 import { startGsiServer } from "./gsi.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const client = new Client({
   intents: [
@@ -23,8 +27,6 @@ const pendingConnections = new Map();
 const steamToDiscord = new Map();
 
 // ─── GSI event queue ─────────────────────────────────────────────────────────
-// GSI events can arrive before the Discord client is logged in (e.g. after pm2 restart).
-// Instead of dropping them, we queue and replay once the client is ready.
 
 const pendingGsiEvents = [];
 let clientReady = false;
@@ -49,12 +51,9 @@ function replayQueuedEvents() {
 }
 
 // ─── Guild-level cooldown ────────────────────────────────────────────────────
-// After a recording stops, block new GSI-triggered recordings for this guild.
-// This prevents ghost recordings when a second GSI player fires
-// gameover → warmup → live immediately after a match ends.
 
-const guildCooldowns = new Map(); // guildId → timestamp of last recording stop
-const GUILD_COOLDOWN_MS = 120_000; // 2 minutes
+const guildCooldowns = new Map();
+const GUILD_COOLDOWN_MS = 120_000;
 
 function isGuildInCooldown(guildId) {
   const lastStop = guildCooldowns.get(guildId);
@@ -68,8 +67,10 @@ function isGuildInCooldown(guildId) {
 }
 
 // ─── Persist Steam→Discord links ─────────────────────────────────────────────
+// Store in discord-bot/data/ so it survives pm2 restarts on GCP.
 
-const LINKS_FILE = "/app/data/steam_links.json";
+const LINKS_DIR  = join(__dirname, "..", "data");
+const LINKS_FILE = join(LINKS_DIR, "steam_links.json");
 
 function loadLinks() {
   try {
@@ -78,7 +79,7 @@ function loadLinks() {
       for (const [steamId, discordId] of Object.entries(data)) {
         steamToDiscord.set(steamId, discordId);
       }
-      console.log(`✅ Loaded ${steamToDiscord.size} Steam link(s)`);
+      console.log(`✅ Loaded ${steamToDiscord.size} Steam link(s) from ${LINKS_FILE}`);
     }
   } catch (err) {
     console.warn("Could not load links file:", err.message);
@@ -87,8 +88,7 @@ function loadLinks() {
 
 function saveLinks() {
   try {
-    const dir = "/app/data";
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (!existsSync(LINKS_DIR)) mkdirSync(LINKS_DIR, { recursive: true });
     writeFileSync(LINKS_FILE, JSON.stringify(Object.fromEntries(steamToDiscord), null, 2));
   } catch (err) {
     console.warn("Could not save links file:", err.message);
@@ -175,7 +175,6 @@ async function startRecording({ guildId, voiceChannel, matchId, playerMap, start
     }
   }
 
-  // Pass steamToDiscord to recorder for live Steam ID resolution of late joiners
   const recorder = new SessionRecorder({ matchId, connection, voiceChannel, playerMap, excludedDiscordIds, steamToDiscord });
   recorder.start();
 
@@ -190,7 +189,6 @@ async function stopRecording(guildId) {
   const audioFiles = await recorder.stop();
   activeSessions.delete(guildId);
 
-  // Set guild cooldown BEFORE upload to block any ghost recordings immediately
   guildCooldowns.set(guildId, Date.now());
   console.log(`🛡️ Guild cooldown set for ${GUILD_COOLDOWN_MS / 1000}s`);
 
@@ -234,7 +232,6 @@ async function handleWarmup({ matchId, steamId }) {
   const { guild, channel } = location;
   const guildId = guild.id;
 
-  // Guild-level cooldown — blocks ghost warmups after match end
   const cooldownElapsed = isGuildInCooldown(guildId);
   if (cooldownElapsed !== false) {
     console.log(`[GSI] Warmup: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
@@ -262,11 +259,9 @@ async function handleMatchStart({ matchId, steamId, startedAt }) {
   const { guild, channel } = location;
   const guildId = guild.id;
 
-  // Guild-level cooldown — blocks ghost recordings after match end
   const cooldownElapsed = isGuildInCooldown(guildId);
   if (cooldownElapsed !== false) {
     console.log(`[GSI] Live: Ignoring — guild cooldown active (${Math.round(cooldownElapsed / 1000)}s since last stop)`);
-    // Clean up any pending connection from a ghost warmup that slipped through
     if (pendingConnections.has(guildId)) {
       const pending = pendingConnections.get(guildId);
       pendingConnections.delete(guildId);
@@ -320,7 +315,6 @@ async function handleMatchEnd({ matchId, steamId }) {
     const pending = pendingConnections.get(guildId);
     pendingConnections.delete(guildId);
     try { pending.connection.destroy(); } catch {}
-    // Also set cooldown when cleaning up a pre-connection
     guildCooldowns.set(guildId, Date.now());
     console.log(`[GSI] Cleaned up pre-connection (match ended without going live) — cooldown set`);
     return;
@@ -329,10 +323,8 @@ async function handleMatchEnd({ matchId, steamId }) {
   if (!activeSessions.has(guildId)) return;
   try {
     await stopRecording(guildId);
-    // stopRecording already sets guildCooldowns
   } catch (err) {
     console.error(`[GSI] Failed to auto-stop:`, err.message);
-    // Set cooldown even on error to prevent ghost recordings
     guildCooldowns.set(guildId, Date.now());
   }
 }
@@ -365,7 +357,8 @@ const commands = [
     .addStringOption((opt) => opt.setName("steamid").setDescription("Your 64-bit Steam ID").setRequired(true)),
 ];
 
-client.once("ready", async () => {
+// Use clientReady event (ready is deprecated in discord.js v15+)
+client.once("clientReady", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   loadLinks();
   const rest = new REST().setToken(process.env.DISCORD_TOKEN);
@@ -376,7 +369,6 @@ client.once("ready", async () => {
     console.error("Failed to register commands:", err.message);
   }
 
-  // Mark client as ready and replay any GSI events that arrived during startup
   clientReady = true;
   replayQueuedEvents();
 });
@@ -425,7 +417,6 @@ client.on("interactionCreate", async (interaction) => {
           try { pending.connection.destroy(); } catch {}
         }
 
-        // Manual /match start clears any guild cooldown
         guildCooldowns.delete(guildId);
 
         const matchId = options.getString("matchid") || `manual-${Date.now()}`;
@@ -454,7 +445,6 @@ client.on("interactionCreate", async (interaction) => {
       else if (sub === "end") {
         if (!activeSessions.has(guildId)) return interaction.editReply("❌ No active recording.");
         const result = await stopRecording(guildId);
-        // stopRecording already sets guildCooldowns
         return interaction.editReply(
           `✅ Session uploaded for match \`${result.matchId}\`\n` +
           `${result.audioFiles.length} player tracks uploaded. Transcription will begin shortly.`
