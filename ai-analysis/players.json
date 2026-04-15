@@ -1,0 +1,18 @@
+{
+  "players": [
+    { "steamId": "76561197978593980", "discordId": "362662223472099331", "nick": "behanc-", "realName": "Lasse", "petName": "Lassi" },
+    { "steamId": "76561197964820831", "discordId": "335492763657306113", "nick": "Disco Dolphin", "realName": "Jacob", "petName": "Disco" },
+    { "steamId": "76561198439398273", "discordId": "398867665193795594", "nick": "EyeCandy", "realName": "Konrad", "petName": "Kierklo" },
+    { "steamId": "76561198796439633", "discordId": "397672077882163200", "nick": "F1GO", "realName": "Morten", "petName": "Figo" },
+    { "steamId": "76561197969328356", "discordId": "227867879599505408", "nick": "Fn-Riz", "realName": "Jacob", "petName": "Fenne" },
+    { "steamId": "76561197960354508", "discordId": "355040665693978624", "nick": "HANSEMINATOR", "realName": "Simon", "petName": "Hansi" },
+    { "steamId": "76561197964274788", "discordId": "417357963733499904", "nick": "kr1sto", "realName": "Kristo", "petName": "Christoffer" },
+    { "steamId": "76561197963699207", "discordId": "343835376231907329", "nick": "LeJoop!", "realName": "Henrik", "petName": "Joopy" },
+    { "steamId": "76561197961244578", "discordId": "136189237677522944", "nick": "Litt-", "realName": "Jeppe", "petName": "Hostrup" },
+    { "steamId": "76561198014743224", "discordId": "324843432542883841", "nick": "LoVitZ", "realName": "Joachim", "petName": "Lovy" },
+    { "steamId": "76561197969498033", "discordId": "388396863214321664", "nick": "Tball", "realName": "Thomas", "petName": "Tball" },
+    { "steamId": "76561197965858580", "discordId": "291832386235138058", "nick": "zarGoth", "realName": "Carsten", "petName": "Goth" },
+    { "steamId": "76561198408411157", "discordId": "335040531123929099", "nick": "ZukwiZ", "realName": "Morten", "petName": "Zukke" },
+    { "steamId": "76561197967217574", "discordId": "387192096865517568", "nick": "kaapaaf", "realName": "Anders", "petName": "Paaf" }
+  ]
+}
