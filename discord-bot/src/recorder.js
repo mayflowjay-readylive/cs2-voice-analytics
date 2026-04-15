@@ -67,17 +67,44 @@ export class SessionRecorder {
       });
     }
 
+    // Track DAVE-failed users to avoid spamming re-subscriptions.
+    // If a user's stream fails with a DAVE decryption error, we give up
+    // re-subscribing them for a cooldown period.
+    const daveFailedUsers = new Map(); // userId → timestamp of last failure
+    const DAVE_FAILURE_COOLDOWN_MS = 10_000;
+
+    // Dedup guard: Discord (with DAVE) sometimes fires speaking events twice
+    // in rapid succession. We ignore duplicate events within 200ms.
+    const lastSpeakingEvent = new Map(); // userId → { event, time }
+    const SPEAKING_DEDUP_MS = 200;
+
+    function isDuplicate(userId, event) {
+      const last = lastSpeakingEvent.get(userId);
+      const now = Date.now();
+      if (last && last.event === event && now - last.time < SPEAKING_DEDUP_MS) {
+        return true;
+      }
+      lastSpeakingEvent.set(userId, { event, time: now });
+      return false;
+    }
+
     console.log(`⏳ Waiting ${DAVE_HANDSHAKE_DELAY_MS}ms for DAVE handshake to complete…`);
     setTimeout(() => {
       console.log(`✅ DAVE delay complete — now listening for speech`);
       this.recordingStartTime = Date.now();
 
       receiver.speaking.on("start", (userId) => {
-        if (this.excludedDiscordIds.has(userId)) {
-          return;
-        }
+        if (this.excludedDiscordIds.has(userId)) return;
+        if (isDuplicate(userId, "start")) return;
 
         console.log(`🗣️ Speaking start detected for ${userId}`);
+
+        // Skip re-subscription if user recently had a DAVE failure
+        const daveFailedAt = daveFailedUsers.get(userId);
+        if (daveFailedAt && Date.now() - daveFailedAt < DAVE_FAILURE_COOLDOWN_MS) {
+          console.log(`⏭️ Skipping ${userId} — DAVE failure cooldown active`);
+          return;
+        }
 
         if (this.receivers.has(userId)) {
           const existing = this.receivers.get(userId);
@@ -90,22 +117,23 @@ export class SessionRecorder {
           const existingSteamId = existing.steamId;
           const existingLastPacketTime = existing.lastPacketTime;
           this.receivers.delete(userId);
-          this._startUserRecording(userId, receiver, existingFilePath, existingSteamId, existingLastPacketTime);
+          this._startUserRecording(userId, receiver, existingFilePath, existingSteamId, existingLastPacketTime, daveFailedUsers);
           return;
         }
 
-        this._startUserRecording(userId, receiver, null, null, null);
+        this._startUserRecording(userId, receiver, null, null, null, daveFailedUsers);
       });
 
       receiver.speaking.on("end", (userId) => {
-        if (this.excludedDiscordIds.has(userId)) {
-          return;
-        }
+        if (this.excludedDiscordIds.has(userId)) return;
+        if (isDuplicate(userId, "end")) return;
 
         console.log(`🔇 Speaking end for ${userId}`);
         if (!this.receivers.has(userId)) {
+          const daveFailedAt = daveFailedUsers.get(userId);
+          if (daveFailedAt && Date.now() - daveFailedAt < DAVE_FAILURE_COOLDOWN_MS) return;
           console.log(`🔄 Missed start for ${userId} during DAVE delay — subscribing now`);
-          this._startUserRecording(userId, receiver, null, null, null);
+          this._startUserRecording(userId, receiver, null, null, null, daveFailedUsers);
         }
       });
     }, DAVE_HANDSHAKE_DELAY_MS);
@@ -118,7 +146,7 @@ export class SessionRecorder {
     writeStream.write(packet);
   }
 
-  _startUserRecording(userId, receiver, existingFilePath, existingSteamId, existingLastPacketTime) {
+  _startUserRecording(userId, receiver, existingFilePath, existingSteamId, existingLastPacketTime, daveFailedUsers = null) {
     // Use live Steam ID lookup instead of only playerMap
     const steamId = existingSteamId || this._resolveSteamId(userId);
     const filePath = existingFilePath || join(this.tmpDir, `audio_${steamId}.opus`);
@@ -166,15 +194,24 @@ export class SessionRecorder {
       lastPacketTime = now;
     });
 
-    // CRITICAL FIX: Destroy the stream on error so that the reconnection
-    // logic in speaking.on("start") can detect it and resubscribe.
-    // Without this, DAVE re-keying errors leave a zombie stream that
-    // blocks reconnection — the player silently drops out for the rest
-    // of the match.
+    // Destroy the stream on error so that the reconnection logic in
+    // speaking.on("start") can detect it and resubscribe.
+    // For DAVE decryption failures (unencrypted packets from older Discord
+    // clients), we record the failure time so the speaking handler can
+    // avoid immediately re-subscribing in an infinite failure loop.
     audioStream.on("error", (err) => {
-      console.warn(`⚠️ Audio stream error for ${userId}: ${err.message}`);
+      const isDaveError = err.message.includes("DecryptionFailed") || err.message.includes("Unencrypted");
+      if (isDaveError) {
+        console.warn(`⚠️ DAVE decryption error for ${userId} (their Discord client may be outdated): ${err.message}`);
+        if (daveFailedUsers) {
+          daveFailedUsers.set(userId, Date.now());
+          console.log(`🛑 ${userId} added to DAVE failure cooldown — audio may be missing for this player`);
+        }
+      } else {
+        console.warn(`⚠️ Audio stream error for ${userId}: ${err.message}`);
+      }
       if (!audioStream.destroyed) {
-        console.log(`💀 Destroying zombie stream for ${userId} — will resubscribe on next speak event`);
+        console.log(`💀 Destroying stream for ${userId} — will resubscribe on next speak event (if not DAVE-failed)`);
         audioStream.destroy();
       }
     });
