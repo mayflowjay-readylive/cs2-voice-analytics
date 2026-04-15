@@ -92,13 +92,6 @@ func newS3Client(ctx context.Context) (*s3.Client, error) {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Log every incoming request so we can trace unexpected callers
-		log.Printf("→ %s %s [origin: %s] [referer: %s]",
-			r.Method, r.URL.Path,
-			r.Header.Get("Origin"),
-			r.Header.Get("Referer"),
-		)
-
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -330,6 +323,7 @@ func handleRetry(w http.ResponseWriter, r *http.Request) {
 	data["status"] = newStatus
 	data["statusUpdatedAt"] = time.Now().UTC().Format(time.RFC3339)
 	delete(data, "error")
+	delete(data, "blocked")
 	data["retryCount"] = 0
 
 	if err := putR2Json(ctx, metaKey, data); err != nil {
