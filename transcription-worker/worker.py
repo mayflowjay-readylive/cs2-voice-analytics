@@ -898,9 +898,9 @@ def main():
                             color=0xFF0000,
                         )
             else:
-                log.debug("No pending sessions, sleeping…")
+                log.info("No pending sessions, sleeping…")
         except Exception as e:
-            log.error(f"Worker loop error: {e}")
+            log.error(f"Worker loop error: {e}", exc_info=True)
         time.sleep(POLL_INTERVAL)
 
 
