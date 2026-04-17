@@ -76,7 +76,9 @@ export class SessionRecorder {
     // Dedup guard: Discord (with DAVE) sometimes fires speaking events twice
     // in rapid succession. We ignore duplicate events within 200ms.
     const lastSpeakingEvent = new Map(); // userId → { event, time }
-    const SPEAKING_DEDUP_MS = 200;
+    const SPEAKING_DEDUP_MS = 1000;
+    // Increased from 200ms — DAVE-encrypted Discord fires duplicate events up to ~500ms apart,
+    // causing two receiver subscriptions that split packets and corrupt audio.
 
     function isDuplicate(userId, event) {
       const last = lastSpeakingEvent.get(userId);
