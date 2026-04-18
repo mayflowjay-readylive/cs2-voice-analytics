@@ -149,6 +149,14 @@ export class SessionRecorder {
   }
 
   _startUserRecording(userId, receiver, existingFilePath, existingSteamId, existingLastPacketTime, daveFailedUsers = null) {
+    // Guard against ghost voice states — Discord sometimes fires speaking events
+    // for users who disconnected abnormally and whose voice state is stale.
+    // Only record users who are actually present in the voice channel.
+    if (this.voiceChannel.members && !this.voiceChannel.members.has(userId)) {
+      console.log(`👻 Skipping ${userId} — not in voice channel members (ghost voice state)`);
+      return;
+    }
+
     // Use live Steam ID lookup instead of only playerMap
     const steamId = existingSteamId || this._resolveSteamId(userId);
     const filePath = existingFilePath || join(this.tmpDir, `audio_${steamId}.opus`);
