@@ -744,6 +744,20 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		timeDiffSec := float64(diff) / 1000.0
 		score := float64(overlap)*1000.0 - timeDiffSec
 
+		// Strongly prefer sessions that are pending_transcription (fresh uploads)
+		// over sessions that already have errors or completed transcripts.
+		// This prevents old failed sessions from being picked over tonight's recording
+		// when player overlap is 0 (e.g. all discord_ IDs due to missing steam_links).
+		status, _ := meta["status"].(string)
+		switch status {
+		case "pending_transcription":
+			score += 5000.0 // strong preference for fresh sessions
+		case "error_transcription", "error_alignment", "error_analysis":
+			score -= 5000.0 // strongly deprioritize failed sessions
+		case "complete":
+			score -= 10000.0 // never pick already-completed sessions
+		}
+
 		candidates = append(candidates, sessionInfo{
 			matchId:       matchId,
 			startedAt:     startedAt,
