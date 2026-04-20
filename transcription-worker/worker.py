@@ -24,6 +24,7 @@ import struct
 import wave
 import tempfile
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
@@ -46,6 +47,7 @@ DISCORD_WEBHOOK_URL   = os.environ.get("DISCORD_WEBHOOK_URL", "")  # optional
 STALE_THRESHOLD_SECONDS = 900   # 15 minutes
 MAX_RETRIES             = 3     # stale-session retries
 MAX_GEMINI_RETRIES      = 3     # retries on empty Gemini response
+GEMINI_TIMEOUT_SECONDS  = 2700  # 45 minutes max per player — prevents infinite hangs
 
 # WAV format constants for duration calculation
 WAV_SAMPLE_RATE       = 48000
@@ -516,6 +518,11 @@ def check_stale_sessions():
     This prevents the stale checker from killing sessions that are actively
     transcribing long audio files — which previously caused concurrent runs
     that deleted audio mid-transcription.
+
+    GHOST SESSION HEALING: If a session prefix exists in R2 but has no meta.json
+    (NoSuchKey), we write a minimal blocked meta.json so the stale checker
+    never wastes time on it again. This prevents ghost sessions from
+    blocking the worker for hours.
     """
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="matches/", Delimiter="/"):
@@ -524,7 +531,34 @@ def check_stale_sessions():
             try:
                 obj  = s3.get_object(Bucket=S3_BUCKET, Key=f"{match_prefix}meta.json")
                 meta = json.loads(obj["Body"].read())
+            except Exception as e:
+                # Ghost session — prefix exists but meta.json is missing.
+                # Write a minimal blocked meta so we never touch this again.
+                if "NoSuchKey" in str(e) or "404" in str(e):
+                    ghost_id = match_prefix.rstrip("/").split("/")[-1]
+                    log.warning(f"👻 Ghost session detected: {ghost_id} — creating blocked meta.json")
+                    try:
+                        s3.put_object(
+                            Bucket=S3_BUCKET,
+                            Key=f"{match_prefix}meta.json",
+                            Body=json.dumps({
+                                "matchId"         : ghost_id,
+                                "status"          : "complete",
+                                "blocked"         : True,
+                                "error"           : "Ghost session — no meta.json found, auto-healed",
+                                "statusUpdatedAt" : datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            }, indent=2),
+                            ContentType="application/json",
+                        )
+                    except Exception as write_err:
+                        log.warning(f"  Could not write ghost meta.json: {write_err}")
+                continue
+
+            try:
                 if meta.get("status") != "transcribing":
+                    continue
+
+                if meta.get("blocked"):
                     continue
 
                 # Use lastProgressAt if available — it's updated after every player
@@ -635,7 +669,11 @@ def update_player_progress(match_id: str, steam_id: str, status: str,
 
 def process_session(match_id: str):
     log.info(f"Processing match: {match_id}")
-    set_status(match_id, "transcribing")
+    set_status(match_id, "transcribing", {
+        # Write lastProgressAt immediately so the stale checker knows
+        # this session is actively being worked on from the very start.
+        "lastProgressAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
     meta     = get_meta(match_id)
     map_name = meta.get("map")
 
@@ -715,7 +753,14 @@ def process_session(match_id: str):
         log.info(f"  WAV size: {len(wav_bytes) / 1024:.1f} KB")
 
         try:
-            utterances = transcribe_with_gemini(wav_bytes, steam_id, map_name)
+            log.info(f"  Transcribing {steam_id} (timeout: {GEMINI_TIMEOUT_SECONDS//60}min)…")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(transcribe_with_gemini, wav_bytes, steam_id, map_name)
+                try:
+                    utterances = future.result(timeout=GEMINI_TIMEOUT_SECONDS)
+                except FuturesTimeoutError:
+                    future.cancel()
+                    raise RuntimeError(f"Gemini transcription timed out after {GEMINI_TIMEOUT_SECONDS//60} minutes")
             log.info(f"  → {len(utterances)} utterances for {steam_id}")
         except Exception as e:
             msg = str(e)
