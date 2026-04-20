@@ -808,34 +808,47 @@ func handleSessionsLink(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// ── Verify ALL copies succeeded before deleting source files ─────────────
+	// This is the atomicity guard. If we delete source files before confirming
+	// the destination is readable, a crash or R2 inconsistency can permanently
+	// lose audio files. We verify by reading back the new meta.json — if it's
+	// not readable, we abort and leave source files intact.
+	newMeta, err := getR2Json(ctx, newPrefix+"meta.json")
+	if err != nil {
+		log.Printf("[link] ⚠️ Verification failed — new meta.json not readable after copy: %v", err)
+		log.Printf("[link] Aborting delete of source files to prevent data loss")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("copy verification failed: new meta.json not readable: %v", err)})
+		return
+	}
+
+	// ── All copies verified — safe to delete source files ────────────────────
 	for _, key := range keys {
 		if err := deleteR2Object(ctx, key); err != nil {
 			log.Printf("[link] Delete error %s: %v (non-fatal)", key, err)
 		}
 	}
+	// ── Update meta.json with new matchId and paths ──────────────────────────
+	newMeta["matchId"] = req.DemoMatchId
 
-	newMeta, err := getR2Json(ctx, newPrefix+"meta.json")
-	if err == nil {
-		newMeta["matchId"] = req.DemoMatchId
-
-		if players, ok := newMeta["players"].([]interface{}); ok {
-			for _, p := range players {
-				if pm, ok := p.(map[string]interface{}); ok {
-					if audioKey, ok := pm["audioKey"].(string); ok {
-						parts := strings.Split(audioKey, "/")
-						filename := parts[len(parts)-1]
-						pm["audioKey"] = newPrefix + filename
-					}
+	if players, ok := newMeta["players"].([]interface{}); ok {
+		for _, p := range players {
+			if pm, ok := p.(map[string]interface{}); ok {
+				if audioKey, ok := pm["audioKey"].(string); ok {
+					parts := strings.Split(audioKey, "/")
+					filename := parts[len(parts)-1]
+					pm["audioKey"] = newPrefix + filename
 				}
 			}
 		}
-
-		if tk, ok := newMeta["transcriptKey"].(string); ok && strings.Contains(tk, best.matchId) {
-			newMeta["transcriptKey"] = strings.Replace(tk, best.matchId, req.DemoMatchId, 1)
-		}
-
-		putR2Json(ctx, newPrefix+"meta.json", newMeta)
 	}
+
+	if tk, ok := newMeta["transcriptKey"].(string); ok && strings.Contains(tk, best.matchId) {
+		newMeta["transcriptKey"] = strings.Replace(tk, best.matchId, req.DemoMatchId, 1)
+	}
+
+	putR2Json(ctx, newPrefix+"meta.json", newMeta)
 
 	log.Printf("✅ Linked session %s → %s (overlap: %d, diff: %ds)",
 		best.matchId, req.DemoMatchId, best.playerOverlap, best.timeDiff/1000)
